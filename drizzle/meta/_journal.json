@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1784165370178,
+      "tag": "0000_even_invaders",
+      "breakpoints": true
+    }
+  ]
+}
