@@ -8,6 +8,34 @@
       "when": 1784165370178,
       "tag": "0000_even_invaders",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1784169180483,
+      "tag": "0001_hot_mother_askani",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784169218013,
+      "tag": "0002_right_doctor_doom",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1784232968242,
+      "tag": "0003_burly_silverclaw",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1784240876091,
+      "tag": "0004_charming_scrambler",
+      "breakpoints": true
     }
   ]
 }
