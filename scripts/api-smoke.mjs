@@ -102,18 +102,27 @@ const comment = await request(`/api/projects/${id}`, {
 assert(comment.response.status === 201 && comment.body?.comment?.message === "Comentario de prueba", "La API no devolvió el comentario creado");
 
 // A collaborator controls clientId, so rotating it must not open a fresh
-// project-wide mutation budget on every request. Use a dedicated network
-// fingerprint to keep this regression independent from the rest of the smoke.
+// project-wide mutation budget on every request. Saturate a dedicated project
+// so a production proxy that owns the client-IP header cannot rate-limit the
+// unrelated identity checks later in this smoke.
+const rateProject = await request("/api/projects", {
+  method: "POST",
+  headers: creationHeaders,
+  body: JSON.stringify({name: "API smoke rate limit", clientId: "rate-smoke", state: created.body.state}),
+});
+assert(rateProject.response.status === 201, "No se pudo crear el proyecto aislado para comprobar límites");
+const rateProjectId = rateProject.body.id;
+const rateProjectToken = rateProject.body.inviteToken;
 const rotatingRateHeaders = {...jsonHeaders, "X-Forwarded-For": "198.51.100.42"};
 // Send the saturation burst concurrently so a production smoke cannot straddle
 // two fixed minute windows merely because of network latency.
 const rotatingCommentStatuses = await Promise.all(Array.from({length: 25}, async (_, index) => {
-  const attempt = await request(`/api/projects/${id}`, {
+  const attempt = await request(`/api/projects/${rateProjectId}`, {
     method: "POST",
     headers: rotatingRateHeaders,
     body: JSON.stringify({
       action: "comment",
-      token,
+      token: rateProjectToken,
       clientId: `rotating-client-${index}`,
       name: "Rotación",
       color: "#123456",
@@ -123,12 +132,12 @@ const rotatingCommentStatuses = await Promise.all(Array.from({length: 25}, async
   return attempt.response.status;
 }));
 assert(rotatingCommentStatuses.includes(429), "Rotar clientId eludió por completo el límite fijo de comentarios por red/proyecto");
-const postLimitComment = await request(`/api/projects/${id}`, {
+const postLimitComment = await request(`/api/projects/${rateProjectId}`, {
   method: "POST",
   headers: rotatingRateHeaders,
   body: JSON.stringify({
     action: "comment",
-    token,
+    token: rateProjectToken,
     clientId: "rotating-client-after-limit",
     name: "Rotación",
     color: "#123456",
@@ -136,6 +145,11 @@ const postLimitComment = await request(`/api/projects/${id}`, {
   }),
 });
 assert(postLimitComment.response.status === 429, "Cambiar clientId reabrió el presupuesto de comentarios después de alcanzar el límite por red/proyecto");
+const rateProjectAfterLimit = await request(`/api/projects/${rateProjectId}?token=${rateProjectToken}`);
+assert(
+  rateProjectAfterLimit.response.ok && rateProjectAfterLimit.body?.comments?.some(item => String(item.message ?? "").startsWith("Límite compartido")),
+  "Los comentarios aceptados antes del límite no quedaron persistidos",
+);
 
 const invalidAsset = await request(`/api/projects/${id}/assets/asset_smoke_123456?token=${token}&format=svg&type=Sound`, {
   method: "PUT", headers: {"Content-Type": "application/octet-stream"}, body: new TextEncoder().encode("<svg/>")
@@ -206,7 +220,6 @@ if (overQuotaAssets.length) {
 const zeroCursor = project.body?.members?.find(member => member.clientId === "api-smoke-presence");
 assert(zeroCursor?.cursorX === 0 && zeroCursor?.cursorY === 0, "La presencia convirtió el cursor 0 en 50");
 assert(project.body?.members?.some(member => member.clientId.startsWith("peer:")) && !project.body?.members?.some(member => member.clientId === "other-secret-client"), "La API expuso el clientId reutilizable de otro colaborador");
-assert(project.body?.comments?.some(item => String(item.message ?? "").startsWith("Límite compartido")), "Los comentarios recientes no quedaron persistidos");
 assert(comment.body.comment.author.startsWith("Invitado · "), "Un comentario anónimo no quedó identificado como invitado");
 const unchangedProject = await request(`/api/projects/${id}?token=${token}&viewer=api-smoke-presence&sinceVersion=${project.body.version}`);
 assert(unchangedProject.response.ok && unchangedProject.body?.stateChanged === false && !("state" in unchangedProject.body), "GET descargó el snapshot aunque la versión no cambió");
