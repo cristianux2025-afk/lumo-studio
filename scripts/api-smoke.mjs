@@ -105,8 +105,9 @@ assert(comment.response.status === 201 && comment.body?.comment?.message === "Co
 // project-wide mutation budget on every request. Use a dedicated network
 // fingerprint to keep this regression independent from the rest of the smoke.
 const rotatingRateHeaders = {...jsonHeaders, "X-Forwarded-For": "198.51.100.42"};
-const rotatingCommentStatuses = [];
-for (let index = 0; index < 25; index += 1) {
+// Send the saturation burst concurrently so a production smoke cannot straddle
+// two fixed minute windows merely because of network latency.
+const rotatingCommentStatuses = await Promise.all(Array.from({length: 25}, async (_, index) => {
   const attempt = await request(`/api/projects/${id}`, {
     method: "POST",
     headers: rotatingRateHeaders,
@@ -119,14 +120,22 @@ for (let index = 0; index < 25; index += 1) {
       message: `Límite compartido ${index}`,
     }),
   });
-  rotatingCommentStatuses.push(attempt.response.status);
-}
-const firstNetworkBlock = rotatingCommentStatuses.indexOf(429);
-assert(firstNetworkBlock >= 0, "Rotar clientId eludió por completo el límite fijo de comentarios por red/proyecto");
-assert(
-  rotatingCommentStatuses.slice(firstNetworkBlock).every(status => status === 429),
-  "Cambiar clientId reabrió el presupuesto de comentarios después de alcanzar el límite por red/proyecto",
-);
+  return attempt.response.status;
+}));
+assert(rotatingCommentStatuses.includes(429), "Rotar clientId eludió por completo el límite fijo de comentarios por red/proyecto");
+const postLimitComment = await request(`/api/projects/${id}`, {
+  method: "POST",
+  headers: rotatingRateHeaders,
+  body: JSON.stringify({
+    action: "comment",
+    token,
+    clientId: "rotating-client-after-limit",
+    name: "Rotación",
+    color: "#123456",
+    message: "Límite compartido posterior",
+  }),
+});
+assert(postLimitComment.response.status === 429, "Cambiar clientId reabrió el presupuesto de comentarios después de alcanzar el límite por red/proyecto");
 
 const invalidAsset = await request(`/api/projects/${id}/assets/asset_smoke_123456?token=${token}&format=svg&type=Sound`, {
   method: "PUT", headers: {"Content-Type": "application/octet-stream"}, body: new TextEncoder().encode("<svg/>")
