@@ -32,8 +32,8 @@ export const defaultProjectState: ProjectState = {
   eventSeq: 0,
   structuralVersion: 0,
   assets: [],
-  selectedSprite: "Lumi",
-  stageBackdrop: "Bosque lunar",
+  selectedSprite: "Stage",
+  stageBackdrop: "Fondo 1",
   activity: [
     { id: "welcome", text: "Proyecto creado en Lumo Studio", at: Date.now() },
   ],
@@ -45,12 +45,35 @@ export const MAX_EVENT_REQUEST_BYTES = 100_000;
 export const MAX_SMALL_REQUEST_BYTES = 8_000;
 export const MAX_PROJECT_ASSETS = 100;
 export const MAX_PROJECT_ASSET_TOTAL_BYTES = 50 * 1024 * 1024;
+// Keep a small server-side buffer so replacing an asset in a project already
+// at its public quota can upload the new immutable blob before the CAS commits.
+export const MAX_STORED_PROJECT_ASSETS = MAX_PROJECT_ASSETS * 3;
+export const MAX_STORED_PROJECT_ASSET_TOTAL_BYTES = MAX_PROJECT_ASSET_TOTAL_BYTES * 2;
+export const PROJECT_ASSET_UPLOAD_LEASE_MS = 30 * 60_000;
 export const MAX_STRUCTURAL_VERSION = 1_000_000_000_000;
 
 export function database() {
   const db = (env as unknown as { DB?: D1DatabaseLike }).DB;
   if (!db) throw new Error("La base de datos colaborativa no está disponible.");
   return db;
+}
+
+export async function pruneUnreferencedProjectAssets(
+  projectId: string,
+  now = Date.now(),
+) {
+  const db = database();
+  const cutoff = now - PROJECT_ASSET_UPLOAD_LEASE_MS;
+  const result = await db.prepare(
+    `DELETE FROM project_assets
+     WHERE project_id = ? AND created_at < ?
+       AND NOT EXISTS (
+         SELECT 1 FROM projects, json_each(projects.state, '$.assets') AS manifest_asset
+         WHERE projects.id = ?
+           AND json_extract(manifest_asset.value, '$.assetId') = project_assets.asset_id
+       )`,
+  ).bind(projectId, cutoff, projectId).run();
+  return Number(result.meta?.changes ?? 0);
 }
 
 let schemaPromise: Promise<void> | null = null;
@@ -260,8 +283,9 @@ export function normalizeProjectState(value: unknown): ProjectState | null {
       at: Number.isFinite(Number(record.at)) ? Number(record.at) : Date.now(),
     }];
   }) : [];
+  if (Array.isArray(input.assets) && input.assets.length > MAX_PROJECT_ASSETS) return null;
   const seenAssets = new Set<string>();
-  const assets: ProjectState["assets"] = Array.isArray(input.assets) ? input.assets.slice(0, MAX_PROJECT_ASSETS).flatMap(item => {
+  const assets: ProjectState["assets"] = Array.isArray(input.assets) ? input.assets.flatMap(item => {
     if (!item || typeof item !== "object") return [];
     const record = item as {assetId?: unknown; dataFormat?: unknown; assetType?: unknown; byteLength?: unknown};
     const assetId = typeof record.assetId === "string" && /^[a-zA-Z0-9_-]{16,128}$/.test(record.assetId) ? record.assetId : "";
@@ -283,8 +307,8 @@ export function normalizeProjectState(value: unknown): ProjectState | null {
     eventSeq,
     structuralVersion,
     assets,
-    selectedSprite: cleanText(input.selectedSprite, "Lumi", 40),
-    stageBackdrop: cleanText(input.stageBackdrop, "Bosque lunar", 60),
+    selectedSprite: cleanText(input.selectedSprite, "Stage", 40),
+    stageBackdrop: cleanText(input.stageBackdrop, "Fondo 1", 60),
     activity,
   };
   if (new TextEncoder().encode(JSON.stringify(normalized)).byteLength > MAX_D1_PAYLOAD_BYTES) return null;

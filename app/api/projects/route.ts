@@ -48,7 +48,15 @@ export async function POST(request: Request) {
   if (!normalizedState) return json({error: "El proyecto es demasiado grande o contiene datos inválidos"}, 413);
   // The project cannot have ordered events before it exists. Keep this cursor
   // server-owned so a crafted creation request cannot poison future polling.
-  const initialState = {...normalizedState, eventSeq: 0, structuralVersion: Math.min(normalizedState.structuralVersion, 1)};
+  // Assets are content-addressed blobs uploaded only after the server assigns
+  // a project id. Never trust a creation-time manifest: the client must PUT
+  // each blob and then commit the canonical, size-checked manifest via PATCH.
+  const initialState = {
+    ...normalizedState,
+    eventSeq: 0,
+    structuralVersion: Math.min(normalizedState.structuralVersion, 1),
+    assets: [],
+  };
   await database().prepare(
     "INSERT INTO projects (id, invite_token, name, state, version, updated_at, updated_by) VALUES (?, ?, ?, ?, 1, ?, ?)",
   ).bind(id, inviteToken, name, JSON.stringify(initialState), now, clientId).run();

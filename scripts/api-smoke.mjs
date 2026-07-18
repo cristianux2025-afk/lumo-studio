@@ -21,11 +21,26 @@ assert(nullCreate.response.status === 400, "POST /api/projects debe rechazar JSO
 const created = await request("/api/projects", {
   method: "POST",
   headers: creationHeaders,
-  body: JSON.stringify({name: "API smoke", clientId: "api-smoke-client"}),
+  body: JSON.stringify({
+    name: "API smoke",
+    clientId: "api-smoke-client",
+    state: {
+      blocksXml: "",
+      projectJson: "",
+      eventSeq: 999,
+      structuralVersion: 999,
+      assets: [{assetId: "creation_asset_123456", dataFormat: "png", assetType: "ImageBitmap", byteLength: 0}],
+      selectedSprite: "Stage",
+      stageBackdrop: "Fondo 1",
+      activity: [],
+    },
+  }),
 });
 assert(created.response.status === 201 && created.body?.id && created.body?.inviteToken && created.body?.state, "No se creó el proyecto de prueba");
 const {id, inviteToken: token} = created.body;
 assert(/^[a-f0-9]{32}$/.test(token), "El token de invitación no contiene 128 bits aleatorios en hexadecimal");
+assert(created.body.state.assets.length === 0, "POST confió en un manifiesto sin blobs verificados");
+assert(created.body.state.eventSeq === 0 && created.body.state.structuralVersion === 1, "POST no normalizó los cursores controlados por el servidor");
 
 const missingToken = await request(`/api/projects/${id}`);
 assert(missingToken.response.status === 404, "GET de proyecto aceptó una invitación ausente");
@@ -151,24 +166,34 @@ const [raceVector, raceBitmap] = await Promise.all([
 assert([raceVector.response.status, raceBitmap.response.status].sort((a, b) => a - b).join(",") === "201,409", "Dos PUT concurrentes aceptaron metadatos incompatibles para el mismo asset");
 
 let atomicQuota = "production-skipped";
+let overQuotaAssets = [];
 if (/^http:\/\/(localhost|127\.0\.0\.1)(:|\/)/.test(base)) {
-  const fillers = await Promise.all(Array.from({length: 96}, (_, index) => {
+  const fillers = await Promise.all(Array.from({length: 101}, (_, index) => {
     const fillerId = `quota_asset_${String(index).padStart(5, "0")}`;
     return request(`/api/projects/${id}/assets/${fillerId}?token=${token}&format=png&type=ImageBitmap`, {
       method: "PUT", headers: {"Content-Type": "application/octet-stream"}, body: new Uint8Array([index % 255]),
     });
   }));
-  assert(fillers.every(item => item.response.status === 201), "No se pudo preparar la prueba de cuota atómica");
-  const contenders = await Promise.all(["a", "b"].map(suffix => request(`/api/projects/${id}/assets/quota_final_${suffix}_123456?token=${token}&format=png&type=ImageBitmap`, {
-    method: "PUT", headers: {"Content-Type": "application/octet-stream"}, body: new Uint8Array([9]),
-  })));
-  const contenderStatuses = contenders.map(item => item.response.status).sort((a, b) => a - b);
-  assert(contenderStatuses.join(",") === "201,429", `La cuota concurrente no fue atómica: ${contenderStatuses.join(",")}`);
-  atomicQuota = true;
+  assert(fillers.every(item => item.response.status === 201), "No se pudo preparar la prueba de cuota activa");
+  overQuotaAssets = Array.from({length: 101}, (_, index) => ({
+    assetId: `quota_asset_${String(index).padStart(5, "0")}`,
+    dataFormat: "png",
+    assetType: "ImageBitmap",
+    byteLength: 1,
+  }));
+  atomicQuota = "prepared";
 }
 
 const project = await request(`/api/projects/${id}?token=${token}&viewer=api-smoke-presence`);
 assert(project.response.ok && !project.body?.inviteToken, "La API expuso el token de invitación");
+if (overQuotaAssets.length) {
+  const overQuotaPatch = await request(`/api/projects/${id}`, {
+    method: "PATCH", headers: jsonHeaders,
+    body: JSON.stringify({token, clientId: "api-smoke-client", name: "Cuota activa", state: {...project.body.state, assets: overQuotaAssets}, expectedVersion: project.body.version}),
+  });
+  assert(overQuotaPatch.response.status === 413, "PATCH aceptó más de 100 recursos activos");
+  atomicQuota = true;
+}
 const zeroCursor = project.body?.members?.find(member => member.clientId === "api-smoke-presence");
 assert(zeroCursor?.cursorX === 0 && zeroCursor?.cursorY === 0, "La presencia convirtió el cursor 0 en 50");
 assert(project.body?.members?.some(member => member.clientId.startsWith("peer:")) && !project.body?.members?.some(member => member.clientId === "other-secret-client"), "La API expuso el clientId reutilizable de otro colaborador");

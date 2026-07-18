@@ -74,13 +74,9 @@ export const scratchThemeComponents = {
   replacementGlowColour: scratchBlockColors.replacementGlow,
 };
 
-export const starterXml = `<xml xmlns="https://developers.google.com/blockly/xml">
-  <block type="event_whenflagclicked" id="lumo_flag" x="72" y="52">
-    <next><block type="motion_movesteps" id="lumo_move"><value name="STEPS"><shadow type="math_number" id="lumo_steps"><field name="NUM">24</field></shadow></value>
-      <next><block type="looks_sayforsecs" id="lumo_say"><value name="MESSAGE"><shadow type="text" id="lumo_message"><field name="TEXT">¡Hola, equipo!</field></shadow></value><value name="SECS"><shadow type="math_number" id="lumo_secs"><field name="NUM">2</field></shadow></value></block></next>
-    </block></next>
-  </block>
-</xml>`;
+// A new project intentionally starts without scripts. Keeping the XML root
+// makes it safe to pass straight to Scratch Blocks' XML parser.
+export const starterXml = `<xml xmlns="https://developers.google.com/blockly/xml"></xml>`;
 
 const value = (name: string, type: string, field = "", content = "") =>
   `<value name="${name}"><shadow type="${type}">${field ? `<field name="${field}">${content}</field>` : ""}</shadow></value>`;
@@ -143,24 +139,54 @@ ${extensionCategories.map(item => item.xml).join("\n")}
 
 export const coreToolbox = makeCoreToolbox(false);
 
-export const stageSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="0 0 480 360"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#17194d"/><stop offset=".58" stop-color="#514989"/><stop offset="1" stop-color="#9b78ad"/></linearGradient></defs><rect width="480" height="360" fill="url(#sky)"/><circle cx="385" cy="72" r="43" fill="#fff4bd"/><circle cx="369" cy="61" r="42" fill="#29285f"/><g fill="#fff" opacity=".8"><circle cx="52" cy="63" r="2"/><circle cx="132" cy="39" r="3"/><circle cx="226" cy="83" r="2"/><circle cx="304" cy="42" r="2"/><circle cx="432" cy="133" r="3"/></g><path d="M0 265Q105 180 240 275T480 248V360H0Z" fill="#315a68"/><path d="M0 305Q155 230 310 310T480 274V360H0Z" fill="#234b5a"/></svg>`;
+// The stage needs one costume for Scratch VM compatibility, but its pixels are
+// deliberately plain: this is a blank canvas rather than placeholder artwork.
+export const stageSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="0 0 480 360"><rect width="480" height="360" fill="#fff"/></svg>`;
 
-export const lumiSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="170" viewBox="0 0 160 170"><g stroke="#6f5861" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path fill="#f8e4a0" d="M43 48 29 9Q63 17 72 44M117 48l14-39q-34 8-43 35"/><path fill="#f8e4a0" d="M80 37c42 0 67 29 67 70 0 38-27 57-67 57s-67-19-67-57c0-41 25-70 67-70Z"/><path fill="none" d="M55 92h1m48 0h1M62 119q18 15 36 0"/><path fill="#f0c878" d="M139 126q25 1 12 24-7 11-19 4"/></g><circle cx="54" cy="91" r="4" fill="#6f5861"/><circle cx="106" cy="91" r="4" fill="#6f5861"/></svg>`;
+// New sprites also need one costume in the Scratch 3 schema. This transparent
+// rectangle establishes editable 320 × 320 bounds without displaying artwork.
+export const blankSpriteSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="0 0 320 320"><rect width="320" height="320" fill="#000" fill-opacity="0"/></svg>`;
 
-export function buildStarterProject(stageAssetId: string, spriteAssetId: string) {
-  const costume = (name: string, assetId: string, cx: number, cy: number) => ({
-    name, bitmapResolution: 1, dataFormat: "svg", assetId, md5ext: `${assetId}.svg`, rotationCenterX: cx, rotationCenterY: cy,
-  });
+const vectorCostume = (name: string, assetId: string, cx: number, cy: number) => ({
+  name,
+  bitmapResolution: 1,
+  dataFormat: "svg",
+  assetId,
+  md5ext: `${assetId}.svg`,
+  rotationCenterX: cx,
+  rotationCenterY: cy,
+});
+
+export function buildBlankSprite(spriteAssetId: string, name: string) {
+  return {
+    isStage: false,
+    name: name.trim() || "Objeto 1",
+    variables: {},
+    lists: {},
+    broadcasts: {},
+    blocks: {},
+    comments: {},
+    currentCostume: 0,
+    costumes: [vectorCostume("Disfraz 1", spriteAssetId, 160, 160)],
+    sounds: [],
+    volume: 100,
+    layerOrder: 1,
+    visible: true,
+    x: 0,
+    y: 0,
+    size: 100,
+    direction: 90,
+    draggable: false,
+    rotationStyle: "all around",
+  };
+}
+
+export function buildStarterProject(stageAssetId: string) {
   return {
     targets: [
       // Scratch 3's project schema requires the stage target name to remain
       // exactly "Stage". The editor still presents it as "Escenario" in the UI.
-      {isStage: true, name: "Stage", variables: {}, lists: {}, broadcasts: {}, blocks: {}, comments: {}, currentCostume: 0, costumes: [costume("Bosque lunar", stageAssetId, 240, 180)], sounds: [], volume: 100, layerOrder: 0, tempo: 60, videoTransparency: 50, videoState: "on", textToSpeechLanguage: null},
-      {isStage: false, name: "Lumi", variables: {}, lists: {}, broadcasts: {}, blocks: {
-        lumo_flag: {opcode: "event_whenflagclicked", next: "lumo_move", parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 72, y: 52},
-        lumo_move: {opcode: "motion_movesteps", next: "lumo_say", parent: "lumo_flag", inputs: {STEPS: [1, [4, "24"]]}, fields: {}, shadow: false, topLevel: false},
-        lumo_say: {opcode: "looks_sayforsecs", next: null, parent: "lumo_move", inputs: {MESSAGE: [1, [10, "¡Hola, equipo!"]], SECS: [1, [4, "2"]]}, fields: {}, shadow: false, topLevel: false},
-      }, comments: {}, currentCostume: 0, costumes: [costume("Lumi", spriteAssetId, 80, 85)], sounds: [], volume: 100, layerOrder: 1, visible: true, x: 0, y: -30, size: 70, direction: 90, draggable: false, rotationStyle: "all around"},
+      {isStage: true, name: "Stage", variables: {}, lists: {}, broadcasts: {}, blocks: {}, comments: {}, currentCostume: 0, costumes: [vectorCostume("Fondo 1", stageAssetId, 240, 180)], sounds: [], volume: 100, layerOrder: 0, tempo: 60, videoTransparency: 50, videoState: "on", textToSpeechLanguage: null},
     ],
     monitors: [], extensions: [], meta: {semver: "3.0.0", vm: "14.1.0", agent: "Lumo Studio"},
   };

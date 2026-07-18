@@ -4,16 +4,41 @@ import Link from "next/link";
 import {ChangeEvent, useCallback, useEffect, useRef, useState} from "react";
 import type {ChatGPTUser} from "./chatgpt-auth";
 import {connectScratchBlocks} from "./connect-scratch-blocks";
-import {buildStarterProject, coreToolbox, lumiSvg, makeCoreToolbox, MAX_PROJECT_ASSET_BYTES, MAX_PROJECT_ASSETS, MAX_PROJECT_ASSET_TOTAL_BYTES, MAX_PROJECT_STATE_BYTES, scratchThemeBlockStyles, scratchThemeComponents, stageSvg, starterXml, type ProjectAssetRef, type ProjectState} from "./studio-config";
+import ImageEditor, {type ImageEditorDocument, type ImageEditorResult} from "./ImageEditor";
+import {blankSpriteSvg, buildBlankSprite, buildStarterProject, coreToolbox, makeCoreToolbox, MAX_PROJECT_ASSET_BYTES, MAX_PROJECT_ASSETS, MAX_PROJECT_ASSET_TOTAL_BYTES, MAX_PROJECT_STATE_BYTES, scratchThemeBlockStyles, scratchThemeComponents, stageSvg, starterXml, type ProjectAssetRef, type ProjectState} from "./studio-config";
 
 type Profile = {handle: string; displayName: string; avatarColor: string};
 type Props = {user: ChatGPTUser | null; profile: Profile | null; signOutPath: string};
-type ActiveTab = "code" | "costumes" | "sounds";
+type ActiveTab = "code" | "costumes" | "backdrops" | "sounds";
 type Member = {clientId: string; name: string; color: string; cursorX: number; cursorY: number; lastSeen: number};
 type Comment = {id: string; author: string; color: string; message: string; createdAt: number};
-type TargetSummary = {id: string; name: string; thumbnail: string; x: number; y: number; size: number; direction: number; isStage: boolean};
-type AssetSummary = {index: number; name: string; dataUri: string};
+type TargetSummary = {id: string; name: string; thumbnail: string; x: number; y: number; size: number; direction: number; visible: boolean; rotationStyle: "all around" | "left-right" | "don't rotate"; isStage: boolean};
+type AssetSummary = {index: number; name: string; dataUri: string; assetId: string; mediaId: string; selected: boolean};
 type RemoteOperation = {seq: number; clientId: string; payload: {targetName?: string; targetId?: string; event?: Record<string, unknown>}};
+
+class AssetSyncError extends Error {
+  retryable: boolean;
+  retryAfterMs: number;
+
+  constructor(message: string, retryable: boolean, retryAfterMs = 1500) {
+    super(message);
+    this.name = "AssetSyncError";
+    this.retryable = retryable;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function responseRetryAfterMs(response: Response, fallback = 1500) {
+  const raw = response.headers.get("Retry-After")?.trim();
+  if (!raw) return fallback;
+  const seconds = Number(raw);
+  const delay = Number.isFinite(seconds)
+    ? seconds * 1000
+    : Date.parse(raw) - Date.now();
+  return Number.isFinite(delay) && delay > 0
+    ? Math.min(60_000, Math.max(250, delay))
+    : fallback;
+}
 
 const colors = ["#6756E8", "#E34884", "#159A80", "#E87817", "#2878D0"];
 const guestNames = ["Luna", "Pixel", "Nova", "Milo", "Sol"];
@@ -38,8 +63,8 @@ const emptyState = (createdAt = 0): ProjectState => ({
   eventSeq: 0,
   structuralVersion: 0,
   assets: [],
-  selectedSprite: "Lumi",
-  stageBackdrop: "Bosque lunar",
+  selectedSprite: "Stage",
+  stageBackdrop: "Fondo 1",
   activity: [{id: createdAt ? crypto.randomUUID() : "lumo-welcome", text: "Proyecto listo para crear", at: createdAt}],
 });
 
@@ -66,6 +91,53 @@ function assetDataUri(asset: any) {
   }
 }
 
+function asciiBytes(data: Uint8Array, offset: number, length: number) {
+  return String.fromCharCode(...data.subarray(offset, offset + length));
+}
+
+function validWavBytes(data: Uint8Array) {
+  if (data.byteLength < 44 || asciiBytes(data, 0, 4) !== "RIFF" || asciiBytes(data, 8, 4) !== "WAVE") return false;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let hasFormat = false;
+  let hasSamples = false;
+  for (let offset = 12; offset + 8 <= data.byteLength;) {
+    const id = asciiBytes(data, offset, 4);
+    const size = view.getUint32(offset + 4, true);
+    const start = offset + 8;
+    const end = start + size;
+    if (end > data.byteLength) return false;
+    if (id === "fmt " && size >= 16) {
+      const format = view.getUint16(start, true);
+      const channels = view.getUint16(start + 2, true);
+      const sampleRate = view.getUint32(start + 4, true);
+      hasFormat = format > 0 && channels > 0 && channels <= 32 && sampleRate > 0 && sampleRate <= 768_000;
+    }
+    if (id === "data" && size > 0) hasSamples = true;
+    offset = end + (size % 2);
+  }
+  return hasFormat && hasSamples;
+}
+
+function validMp3Bytes(data: Uint8Array) {
+  if (data.byteLength < 4) return false;
+  let start = 0;
+  if (data.byteLength >= 10 && asciiBytes(data, 0, 3) === "ID3") {
+    const size = ((data[6] & 0x7f) << 21) | ((data[7] & 0x7f) << 14) | ((data[8] & 0x7f) << 7) | (data[9] & 0x7f);
+    start = Math.min(data.byteLength, 10 + size);
+  }
+  for (let index = start; index + 3 < data.byteLength; index += 1) {
+    const second = data[index + 1];
+    const third = data[index + 2];
+    if (data[index] === 0xff && (second & 0xe0) === 0xe0 && (second & 0x18) !== 0x08 &&
+        (second & 0x06) !== 0 && (third & 0xf0) !== 0 && (third & 0xf0) !== 0xf0 && (third & 0x0c) !== 0x0c) return true;
+  }
+  return false;
+}
+
+function validAudioBytes(data: Uint8Array, extension: string) {
+  return extension === "wav" ? validWavBytes(data) : extension === "mp3" ? validMp3Bytes(data) : false;
+}
+
 function collectProjectAssets(vm: any): ProjectAssetRef[] {
   const assets = new Map<string, ProjectAssetRef>();
   const add = (record: any, fallbackType: ProjectAssetRef["assetType"]) => {
@@ -86,6 +158,17 @@ function collectProjectAssets(vm: any): ProjectAssetRef[] {
     for (const sound of target.getSounds?.() ?? []) add(sound, "Sound");
   }
   return [...assets.values()];
+}
+
+function runtimeAssetById(vm: any, assetId: string) {
+  for (const target of vm?.runtime?.targets ?? []) {
+    if (target.isOriginal === false) continue;
+    for (const record of [...(target.getCostumes?.() ?? []), ...(target.getSounds?.() ?? [])]) {
+      const recordAssetId = String(record?.assetId ?? record?.asset?.assetId ?? "");
+      if (recordAssetId === assetId && record?.asset?.data) return record.asset;
+    }
+  }
+  return null;
 }
 
 function legacyTargetId(target: any, index: number) {
@@ -176,6 +259,245 @@ function bindStableTargetIds(vm: any, projectJson: string, stableIds: Map<string
   });
 }
 
+type ProjectReferenceKind = "target" | "costume" | "backdrop" | "sound";
+type ProjectReference = {kind: ProjectReferenceKind; id: string};
+
+const blockReferenceFields: Record<string, Record<string, ProjectReferenceKind>> = {
+  motion_goto_menu: {TO: "target"},
+  motion_glideto_menu: {TO: "target"},
+  motion_pointtowards_menu: {TOWARDS: "target"},
+  sensing_touchingobjectmenu: {TOUCHINGOBJECTMENU: "target"},
+  event_touchingobjectmenu: {TOUCHINGOBJECTMENU: "target"},
+  sensing_distancetomenu: {DISTANCETOMENU: "target"},
+  sensing_of_object_menu: {OBJECT: "target"},
+  control_create_clone_of_menu: {CLONE_OPTION: "target"},
+  videoSensing_menu_SUBJECT: {SUBJECT: "target"},
+  looks_costume: {COSTUME: "costume"},
+  looks_backdrops: {BACKDROP: "backdrop"},
+  event_whenbackdropswitchesto: {BACKDROP: "backdrop"},
+  sound_sounds_menu: {SOUND_MENU: "sound"},
+};
+
+const projectReferenceSentinels: Record<ProjectReferenceKind, Set<string>> = {
+  target: new Set(["_mouse_", "_edge_", "_random_", "_myself_", "_stage_", "_all_"]),
+  costume: new Set(["next costume", "previous costume", "random costume"]),
+  backdrop: new Set(["next backdrop", "previous backdrop", "random backdrop"]),
+  sound: new Set(),
+};
+
+const monitorReferenceParams: Record<string, Record<string, ProjectReferenceKind>> = {
+  sensing_of: {OBJECT: "target"},
+  sensing_distanceto: {DISTANCETOMENU: "target"},
+  sensing_touchingobject: {TOUCHINGOBJECTMENU: "target"},
+  videoSensing_videoOn: {SUBJECT: "target"},
+};
+
+function fieldText(field: any) {
+  if (Array.isArray(field)) return typeof field[0] === "string" ? field[0] : "";
+  if (field && typeof field === "object") return typeof field.value === "string" ? field.value : "";
+  return typeof field === "string" ? field : "";
+}
+
+function setFieldText(block: any, fieldName: string, value: string) {
+  const field = block?.fields?.[fieldName];
+  if (Array.isArray(field)) field[0] = value;
+  else if (field && typeof field === "object") field.value = value;
+  else if (typeof field === "string") block.fields[fieldName] = value;
+}
+
+function uniqueNameIds(records: any[], idKey: "lumoTargetId" | "lumoMediaId") {
+  const ids = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  for (const record of records) {
+    const name = String(record?.name ?? "");
+    const id = String(record?.[idKey] ?? "");
+    if (!name || !id) continue;
+    if (ids.has(name) && ids.get(name) !== id) ambiguous.add(name);
+    else ids.set(name, id);
+  }
+  for (const name of ambiguous) ids.delete(name);
+  return ids;
+}
+
+function annotateProjectReferences(project: any) {
+  const targets = Array.isArray(project?.targets) ? project.targets : [];
+  // Scratch encodes the stage as sentinels such as `_stage_`; visible target
+  // names in menus always mean sprites. Excluding Stage also keeps a legacy
+  // sprite named "Stage" unambiguous so it can be renamed safely on merge.
+  const targetIdsByName = uniqueNameIds(targets.filter((target: any) => !target?.isStage), "lumoTargetId");
+  const stage = targets.find((target: any) => target?.isStage);
+  const backdropIdsByName = uniqueNameIds(Array.isArray(stage?.costumes) ? stage.costumes : [], "lumoMediaId");
+  for (const target of targets) {
+    const costumeIdsByName = uniqueNameIds(Array.isArray(target?.costumes) ? target.costumes : [], "lumoMediaId");
+    const soundIdsByName = uniqueNameIds(Array.isArray(target?.sounds) ? target.sounds : [], "lumoMediaId");
+    for (const block of Object.values(target?.blocks ?? {}) as any[]) {
+      const definitions = blockReferenceFields[String(block?.opcode ?? "")];
+      if (!definitions) continue;
+      const previous = block.lumoFieldRefs && typeof block.lumoFieldRefs === "object" ? block.lumoFieldRefs : {};
+      const references: Record<string, ProjectReference> = {};
+      for (const [fieldName, kind] of Object.entries(definitions)) {
+        const value = fieldText(block?.fields?.[fieldName]);
+        const id = kind === "target"
+          ? targetIdsByName.get(value)
+          : kind === "costume"
+            ? costumeIdsByName.get(value)
+            : kind === "backdrop"
+              ? backdropIdsByName.get(value)
+              : soundIdsByName.get(value);
+        const oldReference = previous[fieldName] as ProjectReference | undefined;
+        if (id) references[fieldName] = {kind, id};
+        else if (!projectReferenceSentinels[kind].has(value) && oldReference?.kind === kind && typeof oldReference.id === "string" && oldReference.id) references[fieldName] = oldReference;
+      }
+      if (Object.keys(references).length) block.lumoFieldRefs = references;
+      else delete block.lumoFieldRefs;
+    }
+  }
+  for (const monitor of Array.isArray(project?.monitors) ? project.monitors : []) {
+    const targetId = targetIdsByName.get(String(monitor?.spriteName ?? ""));
+    if (targetId) monitor.lumoTargetId = targetId;
+    const definitions = monitorReferenceParams[String(monitor?.opcode ?? "")];
+    if (definitions) {
+      const previous = monitor.lumoParamRefs && typeof monitor.lumoParamRefs === "object" ? monitor.lumoParamRefs : {};
+      const references: Record<string, ProjectReference> = {};
+      for (const [paramName, kind] of Object.entries(definitions)) {
+        const value = String(monitor?.params?.[paramName] ?? "");
+        const id = kind === "target" ? targetIdsByName.get(value) : undefined;
+        const oldReference = previous[paramName] as ProjectReference | undefined;
+        if (id) references[paramName] = {kind, id};
+        else if (!projectReferenceSentinels[kind].has(value) && oldReference?.kind === kind && typeof oldReference.id === "string" && oldReference.id) references[paramName] = oldReference;
+      }
+      if (Object.keys(references).length) monitor.lumoParamRefs = references;
+      else delete monitor.lumoParamRefs;
+    }
+  }
+  return project;
+}
+
+function duplicateSafeName(requested: string, suffix: number, used: Set<string>, reserved: Set<string>, maximum: number) {
+  let number = Math.max(2, suffix);
+  while (number < 100_000) {
+    const ending = ` ${number++}`;
+    const candidate = `${requested.slice(0, Math.max(1, maximum - ending.length))}${ending}`;
+    if (!used.has(candidate) && !reserved.has(candidate)) return candidate;
+  }
+  return `${requested.slice(0, Math.max(1, maximum - 9))} ${crypto.randomUUID().slice(0, 7)}`;
+}
+
+function assignUniqueNames(
+  records: any[],
+  idKey: "lumoTargetId" | "lumoMediaId",
+  baseIds: Set<string>,
+  fallback: string,
+  initiallyReserved: string[] = [],
+  baseNames: Map<string, string> = new Map(),
+) {
+  const groups = new Map<string, any[]>();
+  const ids = new Map<any, string>();
+  const requestedNames = new Map<any, string>();
+  records.forEach((record, index) => {
+    const requested = (String(record?.name ?? "").trim() || fallback).slice(0, 40);
+    const id = String(record?.[idKey] ?? `missing:${index}:${requested}`);
+    ids.set(record, id);
+    requestedNames.set(record, requested);
+    const group = groups.get(requested) ?? [];
+    group.push(record);
+    groups.set(requested, group);
+  });
+  const reserved = new Set([...initiallyReserved, ...groups.keys()]);
+  const used = new Set(initiallyReserved);
+  const assigned = new Map<string, string>();
+  const ordered = (recordsToOrder: any[]) => [...recordsToOrder].sort((left, right) => {
+    const leftId = ids.get(left) ?? "";
+    const rightId = ids.get(right) ?? "";
+    const leftOwnsName = baseNames.get(leftId) === requestedNames.get(left);
+    const rightOwnsName = baseNames.get(rightId) === requestedNames.get(right);
+    return Number(rightOwnsName) - Number(leftOwnsName) ||
+      Number(baseIds.has(rightId)) - Number(baseIds.has(leftId)) ||
+      leftId.localeCompare(rightId);
+  });
+  for (const [requested, group] of groups) {
+    const winner = ordered(group)[0];
+    const id = ids.get(winner) ?? "";
+    if (!used.has(requested)) {
+      winner.name = requested;
+      used.add(requested);
+      assigned.set(id, requested);
+    }
+  }
+  for (const [requested, group] of groups) {
+    let suffix = 2;
+    for (const record of ordered(group).filter(item => !assigned.has(ids.get(item) ?? ""))) {
+      const id = ids.get(record) ?? "";
+      const name = duplicateSafeName(requested, suffix, used, reserved, 40);
+      suffix = Number(name.match(/ (\d+)$/)?.[1] ?? suffix) + 1;
+      record.name = name;
+      used.add(name);
+      assigned.set(id, name);
+    }
+  }
+  return assigned;
+}
+
+function normalizeMergedProjectNames(project: any, baseProject: any) {
+  const targets = Array.isArray(project?.targets) ? project.targets : [];
+  const baseTargets = Array.isArray(baseProject?.targets) ? baseProject.targets : [];
+  const sprites = targets.filter((target: any) => target && !target.isStage);
+  const baseTargetIds = new Set<string>(baseTargets.map((target: any) => String(target?.lumoTargetId ?? "")).filter(Boolean));
+  const baseTargetNames = new Map<string, string>(baseTargets.map((target: any): [string, string] => [String(target?.lumoTargetId ?? ""), String(target?.name ?? "")]).filter(([id]: [string, string]) => Boolean(id)));
+  const stageNames = targets.filter((target: any) => target?.isStage).map((target: any) => String(target.name || "Stage"));
+  const targetNames = assignUniqueNames(sprites, "lumoTargetId", baseTargetIds, "Objeto", stageNames, baseTargetNames);
+  for (const target of targets) {
+    const targetId = String(target?.lumoTargetId ?? "");
+    if (target?.isStage && targetId) targetNames.set(targetId, String(target.name || "Stage"));
+  }
+
+  const costumeNames = new Map<string, Map<string, string>>();
+  const soundNames = new Map<string, Map<string, string>>();
+  for (const target of targets) {
+    const targetId = String(target?.lumoTargetId ?? "");
+    const baseTarget = baseTargets.find((candidate: any) => String(candidate?.lumoTargetId ?? "") === targetId);
+    const baseCostumeIds = new Set<string>((Array.isArray(baseTarget?.costumes) ? baseTarget.costumes : []).map((item: any) => String(item?.lumoMediaId ?? "")).filter(Boolean));
+    const baseSoundIds = new Set<string>((Array.isArray(baseTarget?.sounds) ? baseTarget.sounds : []).map((item: any) => String(item?.lumoMediaId ?? "")).filter(Boolean));
+    const baseCostumeNames = new Map<string, string>((Array.isArray(baseTarget?.costumes) ? baseTarget.costumes : []).map((item: any): [string, string] => [String(item?.lumoMediaId ?? ""), String(item?.name ?? "")]).filter(([id]: [string, string]) => Boolean(id)));
+    const baseSoundNames = new Map<string, string>((Array.isArray(baseTarget?.sounds) ? baseTarget.sounds : []).map((item: any): [string, string] => [String(item?.lumoMediaId ?? ""), String(item?.name ?? "")]).filter(([id]: [string, string]) => Boolean(id)));
+    costumeNames.set(targetId, assignUniqueNames(Array.isArray(target?.costumes) ? target.costumes : [], "lumoMediaId", baseCostumeIds, target?.isStage ? "Fondo" : "Disfraz", [], baseCostumeNames));
+    soundNames.set(targetId, assignUniqueNames(Array.isArray(target?.sounds) ? target.sounds : [], "lumoMediaId", baseSoundIds, "Sonido", [], baseSoundNames));
+  }
+  const stage = targets.find((target: any) => target?.isStage);
+  const stageId = String(stage?.lumoTargetId ?? "");
+  const backdropNames = costumeNames.get(stageId) ?? new Map<string, string>();
+
+  for (const target of targets) {
+    const targetId = String(target?.lumoTargetId ?? "");
+    for (const block of Object.values(target?.blocks ?? {}) as any[]) {
+      const references = block?.lumoFieldRefs && typeof block.lumoFieldRefs === "object" ? block.lumoFieldRefs : {};
+      for (const [fieldName, rawReference] of Object.entries(references)) {
+        const reference = rawReference as ProjectReference;
+        const resolved = reference.kind === "target"
+          ? targetNames.get(reference.id)
+          : reference.kind === "costume"
+            ? costumeNames.get(targetId)?.get(reference.id)
+            : reference.kind === "backdrop"
+              ? backdropNames.get(reference.id)
+              : reference.kind === "sound"
+                ? soundNames.get(targetId)?.get(reference.id)
+                : undefined;
+        if (resolved) setFieldText(block, fieldName, resolved);
+      }
+    }
+  }
+  for (const monitor of Array.isArray(project?.monitors) ? project.monitors : []) {
+    const ownerName = targetNames.get(String(monitor?.lumoTargetId ?? ""));
+    if (ownerName) monitor.spriteName = ownerName;
+    for (const [paramName, rawReference] of Object.entries(monitor?.lumoParamRefs ?? {})) {
+      const reference = rawReference as ProjectReference;
+      const resolved = reference.kind === "target" ? targetNames.get(reference.id) : undefined;
+      if (resolved && monitor.params) monitor.params[paramName] = resolved;
+    }
+  }
+  return project;
+}
+
 function serializeProjectWithTargetIds(vm: any, stableIds: Map<string, string>) {
   const json = vmProjectJson(vm);
   const {parsed, targets} = projectTargets(json);
@@ -196,6 +518,7 @@ function serializeProjectWithTargetIds(vm: any, stableIds: Map<string, string>) 
     target.lumoTargetId = stableId;
     serializeStableMediaIds(target, runtime, usedMediaIds);
   });
+  annotateProjectReferences(parsed);
   return JSON.stringify(parsed);
 }
 
@@ -274,37 +597,58 @@ function mergeProjectJson(base = "", local = "", remote = "") {
     const baseJson = base ? JSON.parse(base) : {};
     const localJson = local ? JSON.parse(local) : {};
     const remoteJson = remote ? JSON.parse(remote) : {};
+    annotateProjectReferences(baseJson);
+    annotateProjectReferences(localJson);
+    annotateProjectReferences(remoteJson);
     const merged = mergeJsonValue(baseJson, localJson, remoteJson);
-    if (Array.isArray(merged?.targets)) {
-      const usedNames = new Set<string>();
-      for (const target of merged.targets) {
-        if (!target || target.isStage) continue;
-        const requested = String(target.name || "Objeto").slice(0, 40);
-        let name = requested;
-        let suffix = 2;
-        while (usedNames.has(name)) name = `${requested.slice(0, 34)} ${suffix++}`;
-        target.name = name;
-        usedNames.add(name);
-      }
-    }
-    return JSON.stringify(merged);
+    return JSON.stringify(normalizeMergedProjectNames(merged, baseJson));
   } catch {
     return local || remote;
   }
 }
 
+function projectJsonAssets(projectJson = ""): ProjectAssetRef[] | null {
+  try {
+    const parsed = projectJson ? JSON.parse(projectJson) : {};
+    const assets = new Map<string, ProjectAssetRef>();
+    const add = (record: any, assetType: ProjectAssetRef["assetType"]) => {
+      const md5ext = String(record?.md5ext ?? "");
+      const assetId = String(record?.assetId ?? md5ext.split(".")[0] ?? "");
+      const dataFormat = String(record?.dataFormat ?? md5ext.split(".").at(-1) ?? "").toLowerCase();
+      if (!/^[a-zA-Z0-9_-]{16,128}$/.test(assetId)) return;
+      if (!/^(svg|png|jpg|jpeg|wav|mp3)$/.test(dataFormat)) return;
+      assets.set(assetId, {assetId, dataFormat, assetType, byteLength: 0});
+    };
+    for (const target of Array.isArray(parsed?.targets) ? parsed.targets : []) {
+      for (const costume of Array.isArray(target?.costumes) ? target.costumes : []) {
+        const format = String(costume?.dataFormat ?? String(costume?.md5ext ?? "").split(".").at(-1) ?? "").toLowerCase();
+        add(costume, format === "svg" ? "ImageVector" : "ImageBitmap");
+      }
+      for (const sound of Array.isArray(target?.sounds) ? target.sounds : []) add(sound, "Sound");
+    }
+    return [...assets.values()];
+  } catch {
+    return null;
+  }
+}
+
 function mergeProjectStates(base: ProjectState, local: ProjectState, remote: ProjectState): ProjectState {
   const choose = <T,>(baseValue: T, localValue: T, remoteValue: T) => sameJsonValue(localValue, baseValue) ? remoteValue : localValue;
-  const assets = new Map<string, ProjectAssetRef>();
-  for (const asset of [...(remote.assets ?? []), ...(local.assets ?? [])]) assets.set(asset.assetId, asset);
+  const projectJson = mergeProjectJson(base.projectJson, local.projectJson, remote.projectJson);
+  const assetCandidates = new Map<string, ProjectAssetRef>();
+  for (const asset of [...(remote.assets ?? []), ...(local.assets ?? [])]) assetCandidates.set(asset.assetId, asset);
+  const referencedAssets = projectJsonAssets(projectJson);
+  const assets = referencedAssets === null
+    ? [...assetCandidates.values()]
+    : referencedAssets.map(asset => assetCandidates.get(asset.assetId) ?? asset);
   const activity = new Map<string, ProjectState["activity"][number]>();
   for (const item of [...(remote.activity ?? []), ...(local.activity ?? [])]) activity.set(item.id, item);
   return {
     blocksXml: choose(base.blocksXml, local.blocksXml, remote.blocksXml),
-    projectJson: mergeProjectJson(base.projectJson, local.projectJson, remote.projectJson),
+    projectJson,
     eventSeq: Math.min(Math.max(0, local.eventSeq ?? 0), Math.max(0, remote.eventSeq ?? 0)),
     structuralVersion: Math.min(MAX_STRUCTURAL_VERSION, Math.max(local.structuralVersion ?? 0, remote.structuralVersion ?? 0) + 1),
-    assets: [...assets.values()],
+    assets,
     selectedSprite: choose(base.selectedSprite, local.selectedSprite, remote.selectedSprite),
     stageBackdrop: choose(base.stageBackdrop, local.stageBackdrop, remote.stageBackdrop),
     activity: [...activity.values()].sort((a, b) => a.at - b.at).slice(-20),
@@ -318,6 +662,8 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
   const stageContainer = useRef<HTMLDivElement>(null);
   const importInput = useRef<HTMLInputElement>(null);
   const costumeInput = useRef<HTMLInputElement>(null);
+  const backdropInput = useRef<HTMLInputElement>(null);
+  const spriteInput = useRef<HTMLInputElement>(null);
   const soundInput = useRef<HTMLInputElement>(null);
   const workspaceRef = useRef<any>(null);
   const scratchRef = useRef<any>(null);
@@ -345,7 +691,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
   const failedRemoteOperations = useRef(new Map<number, number>());
   const drainRemoteOperationsRef = useRef<() => void>(() => {});
   const fpsFrames = useRef(0);
-  const connection = useRef({projectId: "", token: "", version: 0, name: "Aventura en el bosque lunar"});
+  const connection = useRef({projectId: "", token: "", version: 0, name: "Mi proyecto Lumo"});
   const stateRef = useRef<ProjectState>(emptyState());
   const lastSyncedState = useRef<ProjectState>(emptyState());
   const restoreProjectRef = useRef<(state: ProjectState, expectedEpoch?: number, preserveSelection?: boolean) => Promise<boolean>>(async () => false);
@@ -359,13 +705,14 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
 
   const [projectId, setProjectId] = useState("");
   const [token, setToken] = useState("");
-  const [projectName, setProjectName] = useState("Aventura en el bosque lunar");
+  const [projectName, setProjectName] = useState("Mi proyecto Lumo");
   const [version, setVersion] = useState(0);
   const [state, setState] = useState<ProjectState>(() => emptyState());
   const [members, setMembers] = useState<Member[]>([]);
   const [comments, setComments] = useState<Comment[]>([]);
   const [targets, setTargets] = useState<TargetSummary[]>([]);
   const [costumes, setCostumes] = useState<AssetSummary[]>([]);
+  const [backdrops, setBackdrops] = useState<AssetSummary[]>([]);
   const [sounds, setSounds] = useState<AssetSummary[]>([]);
   const [activeTab, setActiveTab] = useState<ActiveTab>("code");
   const [running, setRunning] = useState(false);
@@ -380,6 +727,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
   const [commentText, setCommentText] = useState("");
   const [toast, setToast] = useState("");
   const [loadError, setLoadError] = useState("");
+  const [imageEditor, setImageEditor] = useState<ImageEditorDocument | null>(null);
 
   useEffect(() => {
     setIdentity(readIdentity(user, profile));
@@ -403,7 +751,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
     for (const reference of assets) {
       const cacheKey = `${id}:${reference.assetId}`;
       if (!force && uploadedAssets.current.has(cacheKey)) continue;
-      const asset = storage.get?.(reference.assetId);
+      const asset = storage.get?.(reference.assetId) ?? runtimeAssetById(vmRef.current, reference.assetId);
       if (!asset?.data) throw new Error(`Asset local ausente: ${reference.assetId}`);
       const query = new URLSearchParams({token: inviteToken, format: reference.dataFormat, type: reference.assetType});
       const response = await fetch(`/api/projects/${id}/assets/${encodeURIComponent(reference.assetId)}?${query}`, {
@@ -411,7 +759,13 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
         headers: {"Content-Type": "application/octet-stream"},
         body: asset.data,
       }).catch(() => null);
-      if (!response?.ok) throw new Error(`No se pudo sincronizar ${reference.assetId}`);
+      if (!response) throw new AssetSyncError("Sin conexión para sincronizar los recursos", true);
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({})) as {error?: string};
+        const retryable = response.status === 429 || response.status >= 500;
+        const retryAfterMs = responseRetryAfterMs(response);
+        throw new AssetSyncError(result.error ?? `No se pudo sincronizar ${reference.assetId}`, retryable, retryAfterMs);
+      }
       uploadedAssets.current.add(cacheKey);
     }
   }, []);
@@ -425,16 +779,27 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
     const epoch = projectEpoch.current;
     const schedule = (): Promise<boolean> => {
       saveTimer.current = null;
-      const save = async (): Promise<{ok: boolean; retryable: boolean; savedState?: ProjectState; rebased?: boolean}> => {
+      const save = async (): Promise<{ok: boolean; retryable: boolean; retryAfterMs?: number; savedState?: ProjectState; rebased?: boolean}> => {
         const original = connection.current;
         if (epoch !== projectEpoch.current) return {ok: false, retryable: false};
         if (!original.projectId || !original.token) return {ok: true, retryable: false};
         let baseState = lastSyncedState.current;
         let desiredState = sameJsonValue(editBase, baseState) ? next : mergeProjectStates(editBase, next, baseState);
         let rebased = !sameJsonValue(desiredState, next);
-        const stateFits = () => new TextEncoder().encode(JSON.stringify(desiredState)).byteLength <= MAX_PROJECT_STATE_BYTES;
-        if (!stateFits()) {
-          setSyncStatus("Proyecto demasiado grande para sincronizar");
+        const stateError = () => {
+          if (desiredState.assets.length > MAX_PROJECT_ASSETS) return "El proyecto supera 100 recursos activos";
+          if (desiredState.assets.reduce((total, asset) => total + asset.byteLength, 0) > MAX_PROJECT_ASSET_TOTAL_BYTES) {
+            return "El proyecto supera 50 MB de recursos activos";
+          }
+          if (new TextEncoder().encode(JSON.stringify(desiredState)).byteLength > MAX_PROJECT_STATE_BYTES) {
+            return "Proyecto demasiado grande para sincronizar";
+          }
+          return "";
+        };
+        const initialStateError = stateError();
+        if (initialStateError) {
+          setSyncStatus(initialStateError);
+          showToast(initialStateError);
           return {ok: false, retryable: false};
         }
         localDirty.current = true;
@@ -453,11 +818,16 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
               current.projectId,
               current.token,
               desiredState.assets.filter(asset => !baseAssetIds.has(asset.assetId)),
-              true,
             );
-          } catch {
-            if (epoch === projectEpoch.current) setSyncStatus("Assets pendientes");
-            return {ok: false, retryable: true};
+          } catch (error) {
+            const failure = error instanceof AssetSyncError
+              ? error
+              : new AssetSyncError("Assets pendientes", true);
+            if (epoch === projectEpoch.current) {
+              setSyncStatus(failure.message);
+              if (!failure.retryable) showToast(failure.message);
+            }
+            return {ok: false, retryable: failure.retryable, retryAfterMs: failure.retryAfterMs};
           }
           const response = await fetch(`/api/projects/${current.projectId}`, {
             method: "PATCH",
@@ -496,8 +866,10 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
             lastSyncedState.current = remoteState;
             setVersion(result.version);
             setSyncStatus("Integrando cambios concurrentes…");
-            if (!stateFits()) {
-              setSyncStatus("La combinación supera el límite de sincronización");
+            const mergeError = stateError();
+            if (mergeError) {
+              setSyncStatus(mergeError);
+              showToast(mergeError);
               return {ok: false, retryable: false};
             }
             continue;
@@ -511,12 +883,21 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
                 desiredState.assets.filter(asset => missing.has(asset.assetId)),
                 true,
               );
-            } catch {
-              setSyncStatus("No se pudieron reparar los recursos pendientes");
-              return {ok: false, retryable: true};
+            } catch (error) {
+              const failure = error instanceof AssetSyncError
+                ? error
+                : new AssetSyncError("No se pudieron reparar los recursos pendientes", true);
+              setSyncStatus(failure.message);
+              if (!failure.retryable) showToast(failure.message);
+              return {ok: false, retryable: failure.retryable, retryAfterMs: failure.retryAfterMs};
             }
             setSyncStatus("Reparando recursos del proyecto…");
             continue;
+          }
+          if (response.status === 429) {
+            const retryAfterMs = responseRetryAfterMs(response);
+            setSyncStatus(result.error ?? "Guardado en espera por límite temporal");
+            return {ok: false, retryable: true, retryAfterMs};
           }
           if (response.status === 409) {
             setSyncStatus("No se pudo integrar la versión remota");
@@ -529,6 +910,9 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
           if (response.status === 403 || response.status === 404) {
             setSyncStatus("Invitación inválida");
             return {ok: false, retryable: false};
+          }
+          if (response.status >= 500 && response.headers.has("Retry-After")) {
+            return {ok: false, retryable: true, retryAfterMs: responseRetryAfterMs(response)};
           }
           if (attempt < 3) await new Promise(resolve => window.setTimeout(resolve, 250 * (attempt + 1)));
         }
@@ -564,7 +948,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
         }
         if (result.retryable && revision === localRevision.current && !saveTimer.current) {
           localDirty.current = true;
-          saveTimer.current = setTimeout(() => void schedule(), 1500);
+          saveTimer.current = setTimeout(() => void schedule(), result.retryAfterMs ?? 1500);
         }
         return result;
       });
@@ -576,7 +960,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
     if (immediate) return schedule();
     saveTimer.current = setTimeout(() => void schedule(), 680);
     return Promise.resolve(true);
-  }, [identity.clientId, uploadAssets]);
+  }, [identity.clientId, showToast, uploadAssets]);
 
   const snapshotRuntime = useCallback((message?: string, immediate = false, structural = false) => {
     const vm = vmRef.current;
@@ -631,6 +1015,19 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
             break;
           }
           if (response && [400, 403, 404].includes(response.status)) break;
+          if (response?.status === 429) {
+            const retryAfter = response.headers.get("Retry-After");
+            // A full event log returns 429 without a delay and should fall
+            // back to a structural checkpoint immediately. Rate limiting
+            // provides Retry-After; wait once while preserving queue order.
+            if (!retryAfter || attempt >= 3) break;
+            await new Promise(resolve => window.setTimeout(resolve, responseRetryAfterMs(response)));
+            continue;
+          }
+          if (response && response.status >= 500 && response.headers.has("Retry-After") && attempt < 3) {
+            await new Promise(resolve => window.setTimeout(resolve, responseRetryAfterMs(response)));
+            continue;
+          }
           if (attempt < 3) await new Promise(resolve => window.setTimeout(resolve, 200 * (attempt + 1)));
         }
       } finally {
@@ -704,6 +1101,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
           ScratchBlocks,
           clientId: identity.clientId,
           mergeProjectStates,
+          annotateProjectReferences,
           targetStableIds: targetStableIds.current,
         };
         workspace.registerToolboxCategoryCallback("VARIABLE", ScratchBlocks.ScratchVariables.getVariablesCategory);
@@ -737,12 +1135,14 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
 
         let targetSignature = "";
         let costumeSignature = "";
+        let backdropSignature = "";
         let soundSignature = "";
         let toolboxSignature = "";
         const assetUriCache = new Map<string, string>();
-        const cachedAssetDataUri = (asset: any) => {
+        const cachedAssetDataUri = (asset: any, activeKeys: Set<string>) => {
           const key = String(asset?.assetId ?? "");
           if (!key) return assetDataUri(asset);
+          activeKeys.add(key);
           const cached = assetUriCache.get(key);
           if (cached !== undefined) return cached;
           const uri = assetDataUri(asset);
@@ -750,6 +1150,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
           return uri;
         };
         const refreshRuntime = () => {
+          const activeAssetUriKeys = new Set<string>();
           const editing = vm.editingTarget;
           const runtimeTargets = (vm.runtime?.targets ?? []).filter((target: any) => target.isOriginal !== false);
           const targetKeys: unknown[] = [];
@@ -758,14 +1159,16 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
             const summary = {
               id: target.id,
               name: target.sprite?.name ?? "Objeto",
-              thumbnail: cachedAssetDataUri(asset),
+              thumbnail: cachedAssetDataUri(asset, activeAssetUriKeys),
               x: Math.round(target.x ?? 0),
               y: Math.round(target.y ?? 0),
               size: Math.round(target.size ?? 100),
               direction: Math.round(target.direction ?? 90),
+              visible: target.visible !== false,
+              rotationStyle: target.rotationStyle ?? "all around",
               isStage: Boolean(target.isStage),
             };
-            targetKeys.push([summary.id, summary.name, summary.x, summary.y, summary.size, summary.direction, summary.isStage, asset?.assetId ?? ""]);
+            targetKeys.push([summary.id, summary.name, summary.x, summary.y, summary.size, summary.direction, summary.visible, summary.rotationStyle, summary.isStage, asset?.assetId ?? ""]);
             return summary;
           });
           const nextTargetSignature = JSON.stringify(targetKeys);
@@ -775,15 +1178,21 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
           }
           if (editing) {
             const editingCostumes = editing.getCostumes?.() ?? [];
-            const nextCostumes = editingCostumes.map((costume: any, index: number) => ({index, name: costume.name, dataUri: cachedAssetDataUri(costume.asset)}));
-            const nextCostumeSignature = JSON.stringify(editingCostumes.map((costume: any, index: number) => [index, costume.name, costume.asset?.assetId ?? ""]));
+            const nextCostumes = editingCostumes.map((costume: any, index: number) => {
+              costume.lumoMediaId ||= crypto.randomUUID();
+              return {index, name: costume.name, dataUri: cachedAssetDataUri(costume.asset, activeAssetUriKeys), assetId: String(costume.assetId ?? costume.asset?.assetId ?? ""), mediaId: costume.lumoMediaId, selected: index === editing.currentCostume};
+            });
+            const nextCostumeSignature = JSON.stringify(nextCostumes.map((costume: AssetSummary) => [costume.index, costume.name, costume.assetId, costume.mediaId, costume.selected]));
             if (nextCostumeSignature !== costumeSignature) {
               costumeSignature = nextCostumeSignature;
               setCostumes(nextCostumes);
             }
             const editingSounds = editing.getSounds?.() ?? [];
-            const nextSounds = editingSounds.map((sound: any, index: number) => ({index, name: sound.name, dataUri: cachedAssetDataUri(sound.asset)}));
-            const nextSoundSignature = JSON.stringify(editingSounds.map((sound: any, index: number) => [index, sound.name, sound.asset?.assetId ?? ""]));
+            const nextSounds = editingSounds.map((sound: any, index: number) => {
+              sound.lumoMediaId ||= crypto.randomUUID();
+              return {index, name: sound.name, dataUri: cachedAssetDataUri(sound.asset, activeAssetUriKeys), assetId: String(sound.assetId ?? sound.asset?.assetId ?? ""), mediaId: sound.lumoMediaId, selected: false};
+            });
+            const nextSoundSignature = JSON.stringify(nextSounds.map((sound: AssetSummary) => [sound.index, sound.name, sound.assetId, sound.mediaId]));
             if (nextSoundSignature !== soundSignature) {
               soundSignature = nextSoundSignature;
               setSounds(nextSounds);
@@ -800,6 +1209,20 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
               toolboxSignature = nextToolboxSignature;
               workspace.updateToolbox(makeCoreToolbox(Boolean(editing.isStage), extensionXml));
             }
+          }
+          const stage = vm.runtime?.getTargetForStage?.();
+          const stageCostumes = stage?.getCostumes?.() ?? [];
+          const nextBackdrops = stageCostumes.map((backdrop: any, index: number) => {
+            backdrop.lumoMediaId ||= crypto.randomUUID();
+            return {index, name: backdrop.name, dataUri: cachedAssetDataUri(backdrop.asset, activeAssetUriKeys), assetId: String(backdrop.assetId ?? backdrop.asset?.assetId ?? ""), mediaId: backdrop.lumoMediaId, selected: index === stage.currentCostume};
+          });
+          const nextBackdropSignature = JSON.stringify(nextBackdrops.map((backdrop: AssetSummary) => [backdrop.index, backdrop.name, backdrop.assetId, backdrop.mediaId, backdrop.selected]));
+          if (nextBackdropSignature !== backdropSignature) {
+            backdropSignature = nextBackdropSignature;
+            setBackdrops(nextBackdrops);
+          }
+          for (const key of assetUriCache.keys()) {
+            if (!activeAssetUriKeys.has(key)) assetUriCache.delete(key);
           }
         };
         const scheduleRuntimeRefresh = () => {
@@ -850,8 +1273,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
           return String(asset.assetId);
         };
         const stageAssetId = cacheSvg(stageSvg);
-        const spriteAssetId = cacheSvg(lumiSvg);
-        const starterProject = buildStarterProject(stageAssetId, spriteAssetId);
+        const starterProject = buildStarterProject(stageAssetId);
         starterProjectRef.current = starterProject;
 
         const hydrateProjectAssets = async (projectState: ProjectState) => {
@@ -1203,7 +1625,8 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
       cursor.current = {x: Math.round(((event.clientX - rect.left) / rect.width) * 100), y: Math.round(((event.clientY - rect.top) / rect.height) * 100)};
     };
     const key = (event: KeyboardEvent, isDown: boolean) => {
-      if (isDown && event.target instanceof HTMLInputElement) return;
+      const element = event.target instanceof HTMLElement ? event.target : null;
+      if (isDown && (element?.closest("input, textarea, select, button, [role='dialog']") || imageEditor)) return;
       vmRef.current?.postIOData?.("keyboard", {key: (!event.key || event.key === "Dead") ? event.keyCode : event.key, isDown});
     };
     const down = (event: KeyboardEvent) => key(event, true);
@@ -1216,11 +1639,12 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
     };
-  }, []);
+  }, [imageEditor]);
 
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        if (document.querySelector('[data-testid="image-editor"]')) return;
         setInviteOpen(false);
         setExtensionOpen(false);
       }
@@ -1233,14 +1657,23 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
     if (!runtimeReady || !vmRef.current) throw new Error("El motor todavía está cargando");
     const current = connection.current;
     if (current.projectId && current.token) {
-      await uploadAssets(current.projectId, current.token, stateRef.current.assets);
+      // A previous creation attempt may already have assigned an id while its
+      // first canonical PATCH failed. Never reveal that invite until the
+      // current VM state and manifest have both been confirmed by the server.
+      const saved = await snapshotRuntime(undefined, true);
+      if (!saved) throw new Error("No se pudo confirmar el proyecto compartido");
+      const url = new URL(window.location.href);
+      url.searchParams.set("project", current.projectId);
+      url.searchParams.set("invite", current.token);
+      window.history.replaceState({}, "", url);
       return {id: current.projectId, inviteToken: current.token, version: current.version};
     }
     if (projectCreation.current) return projectCreation.current;
     const epoch = projectEpoch.current;
     const creation = (async () => {
       setSyncStatus("Creando proyecto…");
-      await snapshotRuntime(undefined, true);
+      const captured = await snapshotRuntime(undefined, true);
+      if (!captured) throw new Error("No se pudo preparar el proyecto compartido");
       const creationState = stateRef.current;
       const response = await fetch("/api/projects", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name: projectName, clientId: identity.clientId, state: creationState})});
       if (!response.ok) throw new Error("No se pudo crear el proyecto");
@@ -1249,8 +1682,11 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
       connection.current = {projectId: data.id, token: data.inviteToken, version: data.version, name: projectName};
       lastSyncedState.current = data.state;
       const stateAfterRequest = stateRef.current;
+      // POST deliberately creates an empty manifest because blobs cannot be
+      // uploaded before a project id exists. Preserve the local snapshot,
+      // upload its assets, then make the first size-checked PATCH canonical.
       const reconciledState = sameJsonValue(stateAfterRequest, creationState)
-        ? data.state
+        ? creationState
         : mergeProjectStates(creationState, stateAfterRequest, data.state);
       stateRef.current = reconciledState;
       setState(reconciledState);
@@ -1259,12 +1695,15 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
       setVersion(data.version);
       await uploadAssets(data.id, data.inviteToken, reconciledState.assets);
       if (epoch !== projectEpoch.current) throw new Error("La creación del proyecto fue cancelada");
-      if (!sameJsonValue(data.state, stateRef.current)) await persistSnapshot(stateRef.current, true);
+      if (!sameJsonValue(data.state, stateRef.current)) {
+        const saved = await persistSnapshot(stateRef.current, true);
+        if (!saved) throw new Error("No se pudo confirmar el proyecto compartido");
+      }
       const url = new URL(window.location.href);
       url.searchParams.set("project", data.id);
       url.searchParams.set("invite", data.inviteToken);
       window.history.replaceState({}, "", url);
-      return data;
+      return {...data, version: connection.current.version};
     })();
     projectCreation.current = creation;
     try {
@@ -1315,39 +1754,137 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
   };
 
   const selectSprite = (targetId: string) => {
-    vmRef.current?.setEditingTarget(targetId);
+    const vm = vmRef.current;
+    const target = vm?.runtime?.getTargetById?.(targetId);
+    vm?.setEditingTarget(targetId);
+    if (target?.isStage && activeTab === "costumes") setActiveTab("backdrops");
+    if (target && !target.isStage && activeTab === "backdrops") setActiveTab("costumes");
     refreshRuntimeRef.current();
   };
 
-  const addSprite = async () => {
+  const openTab = (tab: ActiveTab) => {
     const vm = vmRef.current;
-    const source = vm?.editingTarget && !vm.editingTarget.isStage ? vm.editingTarget : vm?.runtime?.targets?.find((target: any) => !target.isStage);
-    if (!runtimeReady || !source) return showToast("El motor todavía está cargando");
+    if (tab === "backdrops") {
+      const stage = vm?.runtime?.getTargetForStage?.();
+      if (stage) vm.setEditingTarget(stage.id);
+    } else if (tab === "costumes" && vm?.editingTarget?.isStage) {
+      const firstSprite = vm.runtime?.targets?.find((target: any) => target.isOriginal !== false && !target.isStage);
+      if (firstSprite) vm.setEditingTarget(firstSprite.id);
+    }
+    setActiveTab(tab);
+    refreshRuntimeRef.current();
+  };
+
+  const createBlankSpriteTarget = async (name?: string) => {
+    const vm = vmRef.current;
+    const storage = storageRef.current;
+    if (!runtimeReady || !vm || !storage) throw new Error("Motor no disponible");
+    const number = vm.runtime.targets.filter((target: any) => target.isOriginal !== false && !target.isStage).length + 1;
+    const data = new TextEncoder().encode(blankSpriteSvg);
+    const asset = storage.createAsset(storage.AssetType.ImageVector, storage.DataFormat.SVG, data, undefined, true);
+    storage.builtinHelper._store(storage.AssetType.ImageVector, storage.DataFormat.SVG, data, asset.assetId);
+    await vm.addSprite(buildBlankSprite(String(asset.assetId), (name || `Sprite ${number}`).slice(0, 40)));
+    const target = vm.editingTarget;
+    if (!target || target.isStage) throw new Error("El sprite no se creó");
+    return target;
+  };
+
+  const ensureImageIdentity = (target: any, index: number) => {
+    const costume = target?.getCostumes?.()?.[index];
+    if (!target || !costume) return null;
+    let targetStableId = targetStableIds.current.get(target.id);
+    if (!targetStableId) {
+      targetStableId = crypto.randomUUID();
+      targetStableIds.current.set(target.id, targetStableId);
+    }
+    costume.lumoMediaId ||= crypto.randomUUID();
+    return {targetStableId, mediaId: String(costume.lumoMediaId)};
+  };
+
+  const openImageEditor = (target: any, index: number, kind: ImageEditorDocument["kind"]) => {
+    const costume = target?.getCostumes?.()?.[index];
+    if (!target || !costume) return showToast(kind === "backdrop" ? "Ese fondo ya no existe" : "Ese disfraz ya no existe");
+    const identity = ensureImageIdentity(target, index);
+    if (!identity) return showToast(kind === "backdrop" ? "Ese fondo ya no existe" : "Ese disfraz ya no existe");
+    const resolution = Math.max(1, Number(costume.bitmapResolution) || 1);
+    const logicalWidth = Number(costume.size?.[0]) / resolution;
+    const logicalHeight = Number(costume.size?.[1]) / resolution;
+    const rotationCenterX = Number(costume.rotationCenterX) / resolution;
+    const rotationCenterY = Number(costume.rotationCenterY) / resolution;
+    setImageEditor({
+      kind,
+      name: costume.name,
+      dataUri: assetDataUri(costume.asset),
+      sourceExpected: true,
+      ...(Number.isFinite(logicalWidth) && logicalWidth > 0 ? {width: Math.round(logicalWidth)} : {}),
+      ...(Number.isFinite(logicalHeight) && logicalHeight > 0 ? {height: Math.round(logicalHeight)} : {}),
+      ...(Number.isFinite(rotationCenterX) ? {rotationCenterX} : {}),
+      ...(Number.isFinite(rotationCenterY) ? {rotationCenterY} : {}),
+      background: kind === "backdrop" ? "white" : "transparent",
+      targetId: target.id,
+      targetStableId: identity.targetStableId,
+      mediaId: identity.mediaId,
+      index,
+    });
+  };
+
+  const reopenImageEditor = (identity: {targetStableId: string; mediaId: string}, kind: ImageEditorDocument["kind"]) => {
+    const vm = vmRef.current;
+    const target = vm?.runtime?.targets?.find((candidate: any) => candidate.isOriginal !== false && targetStableIds.current.get(candidate.id) === identity.targetStableId);
+    const index = target?.getCostumes?.().findIndex((costume: any) => costume.lumoMediaId === identity.mediaId) ?? -1;
+    if (!target || index < 0) {
+      showToast(kind === "backdrop" ? "Ese fondo ya no existe" : "Ese disfraz ya no existe");
+      return;
+    }
+    openImageEditor(target, index, kind);
+  };
+
+  const addSprite = async () => {
+    if (!runtimeReady) return showToast("El motor todavía está cargando");
     try {
-      await vm.duplicateSprite(source.id);
-      const target = vm.editingTarget;
-      const number = vm.runtime.targets.filter((item: any) => !item.isStage).length;
-      vm.renameSprite(target.id, `Objeto ${number}`);
+      const target = await createBlankSpriteTarget();
+      const imageIdentity = ensureImageIdentity(target, 0);
+      if (!imageIdentity) throw new Error("El disfraz inicial no se creó");
+      setActiveTab("costumes");
       refreshRuntimeRef.current();
-      snapshotRuntime(`${identity.name} añadió un personaje`, true, true);
+      await snapshotRuntime(`${identity.name} añadió un sprite en blanco`, true, true);
+      refreshRuntimeRef.current();
+      reopenImageEditor(imageIdentity, "costume");
     } catch {
-      showToast("No se pudo añadir el personaje");
+      showToast("No se pudo añadir el sprite");
     }
   };
 
   const deleteSelectedSprite = () => {
     const vm = vmRef.current;
-    if (!vm?.editingTarget || vm.editingTarget.isStage || targets.filter(target => !target.isStage).length <= 1) return showToast("El proyecto necesita al menos un personaje");
+    if (!vm?.editingTarget || vm.editingTarget.isStage) return showToast("Selecciona un sprite para eliminarlo");
     if (!window.confirm(`¿Eliminar ${vm.editingTarget.sprite.name}?`)) return;
     vm.deleteSprite(vm.editingTarget.id);
     refreshRuntimeRef.current();
-    snapshotRuntime(`${identity.name} eliminó un personaje`, true, true);
+    snapshotRuntime(`${identity.name} eliminó un sprite`, true, true);
   };
 
   const setSpriteProperty = (property: "x" | "y" | "size" | "direction", value: string) => {
     const number = Number(value);
     if (!Number.isFinite(number)) return;
     vmRef.current?.postSpriteInfo?.({[property]: number});
+    refreshRuntimeRef.current();
+    snapshotRuntime(undefined, false, true);
+  };
+
+  const renameSelectedSprite = (value: string) => {
+    const vm = vmRef.current;
+    const target = vm?.editingTarget;
+    const name = value.trim().slice(0, 40);
+    if (!target || target.isStage || !name || name === target.sprite?.name) return;
+    vm.renameSprite(target.id, name);
+    refreshRuntimeRef.current();
+    snapshotRuntime(`${identity.name} renombró un sprite`, true, true);
+  };
+
+  const setSpriteOption = (property: "visible" | "rotationStyle", value: boolean | TargetSummary["rotationStyle"]) => {
+    if (!vmRef.current?.editingTarget || vmRef.current.editingTarget.isStage) return;
+    vmRef.current.postSpriteInfo({[property]: value});
     refreshRuntimeRef.current();
     snapshotRuntime(undefined, false, true);
   };
@@ -1394,7 +1931,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
       anchor.href = url;
       anchor.download = `${projectName.replace(/[^a-z0-9áéíóúñ _-]/gi, "").trim() || "lumo-proyecto"}.sb3`;
       anchor.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
       showToast("Proyecto .sb3 exportado");
     } catch {
       showToast("No se pudo exportar el proyecto");
@@ -1408,62 +1945,222 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
     return {asset, name: file.name.replace(/\.[^.]+$/, "").slice(0, 40), assetId: String(asset.assetId), dataFormat, md5: `${asset.assetId}.${dataFormat}`, md5ext: `${asset.assetId}.${dataFormat}`};
   };
 
+  const imageRecordForFile = async (file: File) => {
+    if (file.size > MAX_PROJECT_ASSET_BYTES) {
+      showToast("Cada recurso puede pesar hasta 1,75 MB");
+      return null;
+    }
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    if (!extension || !["svg", "png", "jpg", "jpeg"].includes(extension)) {
+      showToast("Usa un SVG, PNG o JPG");
+      return null;
+    }
+    const format = extension === "jpeg" ? "jpg" : extension;
+    const storage = storageRef.current;
+    if (!storage) return null;
+    const data = new Uint8Array(await file.arrayBuffer());
+    return cacheAsset(file, format === "svg" ? storage.AssetType.ImageVector : storage.AssetType.ImageBitmap, format, data);
+  };
+
+  const targetForImageKind = (kind: ImageEditorDocument["kind"]) => {
+    const vm = vmRef.current;
+    return kind === "backdrop" ? vm?.runtime?.getTargetForStage?.() : (vm?.editingTarget && !vm.editingTarget.isStage ? vm.editingTarget : null);
+  };
+
   const addCostumeFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
-    if (!runtimeReady || !vmRef.current?.editingTarget) return showToast("El motor todavía está cargando");
-    if (file.size > MAX_PROJECT_ASSET_BYTES) return showToast("Cada recurso puede pesar hasta 1,75 MB");
-    const extension = file.name.split(".").pop()?.toLowerCase();
-    if (!extension || !["svg", "png", "jpg", "jpeg"].includes(extension)) return showToast("Usa un SVG, PNG o JPG");
+    const target = targetForImageKind("costume");
+    if (!runtimeReady || !target) return showToast("Añade o selecciona primero un sprite");
     try {
-      const format = extension === "jpeg" ? "jpg" : extension;
-      const storage = storageRef.current;
-      const data = new Uint8Array(await file.arrayBuffer());
-      const record = cacheAsset(file, format === "svg" ? storage.AssetType.ImageVector : storage.AssetType.ImageBitmap, format, data);
-      await vmRef.current.addCostume(record.md5ext, {...record, bitmapResolution: format === "svg" ? 1 : 2}, vmRef.current.editingTarget.id);
+      const record = await imageRecordForFile(file);
+      if (!record) return;
+      await vmRef.current.addCostume(record.md5ext, {...record, bitmapResolution: record.dataFormat === "svg" ? 1 : 2}, target.id);
+      const imageIdentity = ensureImageIdentity(target, target.getCostumes().length - 1);
+      if (!imageIdentity) throw new Error("El disfraz no se creó");
       refreshRuntimeRef.current();
-      snapshotRuntime(`${identity.name} añadió el disfraz ${record.name}`, true, true);
+      await snapshotRuntime(`${identity.name} añadió el disfraz ${record.name}`, true, true);
+      refreshRuntimeRef.current();
+      reopenImageEditor(imageIdentity, "costume");
     } catch {
       showToast("No se pudo cargar ese disfraz");
     }
   };
 
-  const createCostume = async () => {
+  const addBackdropFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
     const vm = vmRef.current;
-    const storage = storageRef.current;
-    if (!runtimeReady || !vm?.editingTarget || !storage) return showToast("El motor todavía está cargando");
+    const stage = targetForImageKind("backdrop");
+    if (!runtimeReady || !vm || !stage) return showToast("El motor todavía está cargando");
     try {
-      const number = (vm.editingTarget.getCostumes?.()?.length ?? 0) + 1;
-      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><circle cx="80" cy="80" r="68" fill="${colors[number % colors.length]}"/><path d="M48 92q32 28 64 0" fill="none" stroke="white" stroke-width="8" stroke-linecap="round"/><circle cx="54" cy="61" r="8" fill="white"/><circle cx="106" cy="61" r="8" fill="white"/></svg>`;
-      const data = new TextEncoder().encode(svg);
-      const file = new File([data], `Disfraz ${number}.svg`, {type: "image/svg+xml"});
-      const record = cacheAsset(file, storage.AssetType.ImageVector, "svg", data);
-      await vm.addCostume(record.md5ext, {...record, bitmapResolution: 1, rotationCenterX: 80, rotationCenterY: 80}, vm.editingTarget.id);
+      const record = await imageRecordForFile(file);
+      if (!record) return;
+      setActiveTab("backdrops");
+      vm.setEditingTarget(stage.id);
+      await vm.addBackdrop(record.md5ext, {...record, bitmapResolution: record.dataFormat === "svg" ? 1 : 2});
+      const imageIdentity = ensureImageIdentity(stage, stage.getCostumes().length - 1);
+      if (!imageIdentity) throw new Error("El fondo no se creó");
       refreshRuntimeRef.current();
-      snapshotRuntime(`${identity.name} creó un disfraz`, true, true);
+      await snapshotRuntime(`${identity.name} añadió el fondo ${record.name}`, true, true);
+      refreshRuntimeRef.current();
+      reopenImageEditor(imageIdentity, "backdrop");
     } catch {
-      showToast("No se pudo crear el disfraz");
+      showToast("No se pudo cargar ese fondo");
     }
   };
 
-  const renameCostume = (index: number, current: string) => {
-    const name = window.prompt("Nombre del disfraz", current)?.trim();
+  const addSpriteFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!runtimeReady) return showToast("El motor todavía está cargando");
+    try {
+      const record = await imageRecordForFile(file);
+      if (!record) return;
+      const vm = vmRef.current;
+      const target = await createBlankSpriteTarget(record.name);
+      await vm.addCostume(record.md5ext, {...record, bitmapResolution: record.dataFormat === "svg" ? 1 : 2}, target.id);
+      vm.setEditingTarget(target.id);
+      vm.deleteCostume(0);
+      const imageIdentity = ensureImageIdentity(target, 0);
+      if (!imageIdentity) throw new Error("El disfraz no se creó");
+      setActiveTab("costumes");
+      refreshRuntimeRef.current();
+      await snapshotRuntime(`${identity.name} subió el sprite ${target.sprite.name}`, true, true);
+      refreshRuntimeRef.current();
+      reopenImageEditor(imageIdentity, "costume");
+    } catch {
+      showToast("No se pudo crear el sprite con esa imagen");
+    }
+  };
+
+  const createImage = async (kind: ImageEditorDocument["kind"]) => {
+    const vm = vmRef.current;
+    const storage = storageRef.current;
+    const target = targetForImageKind(kind);
+    if (!runtimeReady || !vm || !storage || !target) return showToast(kind === "backdrop" ? "El motor todavía está cargando" : "Añade o selecciona primero un sprite");
+    try {
+      const number = (target.getCostumes?.()?.length ?? 0) + 1;
+      const svg = kind === "backdrop" ? stageSvg : blankSpriteSvg;
+      const data = new TextEncoder().encode(svg);
+      const baseName = kind === "backdrop" ? `Fondo ${number}` : `Disfraz ${number}`;
+      const file = new File([data], `${baseName}.svg`, {type: "image/svg+xml"});
+      const record = cacheAsset(file, storage.AssetType.ImageVector, "svg", data);
+      if (kind === "backdrop") {
+        setActiveTab("backdrops");
+        vm.setEditingTarget(target.id);
+        await vm.addBackdrop(record.md5ext, {...record, bitmapResolution: 1, rotationCenterX: 240, rotationCenterY: 180});
+      } else {
+        await vm.addCostume(record.md5ext, {...record, bitmapResolution: 1, rotationCenterX: 160, rotationCenterY: 160}, target.id);
+      }
+      const imageIdentity = ensureImageIdentity(target, target.getCostumes().length - 1);
+      if (!imageIdentity) throw new Error("La imagen no se creó");
+      refreshRuntimeRef.current();
+      await snapshotRuntime(`${identity.name} creó ${kind === "backdrop" ? "un fondo" : "un disfraz"} en blanco`, true, true);
+      refreshRuntimeRef.current();
+      reopenImageEditor(imageIdentity, kind);
+    } catch {
+      showToast(kind === "backdrop" ? "No se pudo crear el fondo" : "No se pudo crear el disfraz");
+    }
+  };
+
+  const createCostume = () => createImage("costume");
+  const createBackdrop = () => createImage("backdrop");
+
+  const renameCostume = (index: number, current: string, kind: ImageEditorDocument["kind"]) => {
+    const name = window.prompt(kind === "backdrop" ? "Nombre del fondo" : "Nombre del disfraz", current)?.trim();
     if (!name) return;
+    const target = targetForImageKind(kind);
+    if (!target) return showToast("Ese recurso ya no existe");
+    vmRef.current?.setEditingTarget(target.id);
     vmRef.current?.renameCostume(index, name.slice(0, 40));
     refreshRuntimeRef.current();
-    snapshotRuntime(`${identity.name} renombró un disfraz`, true, true);
+    snapshotRuntime(`${identity.name} renombró ${kind === "backdrop" ? "un fondo" : "un disfraz"}`, true, true);
   };
-  const deleteCostume = (index: number) => {
-    if ((vmRef.current?.editingTarget?.getCostumes?.()?.length ?? 0) <= 1) return showToast("Cada personaje necesita un disfraz");
+  const deleteCostume = (index: number, kind: ImageEditorDocument["kind"]) => {
+    const target = targetForImageKind(kind);
+    if (!target) return showToast("Ese recurso ya no existe");
+    if ((target.getCostumes?.()?.length ?? 0) <= 1) return showToast(kind === "backdrop" ? "El escenario necesita al menos un fondo" : "Cada sprite necesita al menos un disfraz");
+    vmRef.current?.setEditingTarget(target.id);
     vmRef.current?.deleteCostume(index);
     refreshRuntimeRef.current();
-    snapshotRuntime(`${identity.name} eliminó un disfraz`, true, true);
+    snapshotRuntime(`${identity.name} eliminó ${kind === "backdrop" ? "un fondo" : "un disfraz"}`, true, true);
   };
-  const selectCostume = (index: number) => {
-    vmRef.current?.editingTarget?.setCostume?.(index);
+  const selectCostume = (index: number, kind: ImageEditorDocument["kind"]) => {
+    const target = targetForImageKind(kind);
+    if (!target) return;
+    vmRef.current?.setEditingTarget(target.id);
+    target.setCostume?.(index);
     refreshRuntimeRef.current();
-    snapshotRuntime(`${identity.name} cambió el disfraz`, true, true);
+    snapshotRuntime(`${identity.name} cambió ${kind === "backdrop" ? "el fondo" : "el disfraz"}`, true, true);
+  };
+
+  const saveImageEdit = async (result: ImageEditorResult) => {
+    const editor = imageEditor;
+    const vm = vmRef.current;
+    if (!editor || !vm) return false;
+    if (new TextEncoder().encode(result.svg).byteLength > MAX_PROJECT_ASSET_BYTES) {
+      showToast("El dibujo supera el máximo de 1,75 MB");
+      return false;
+    }
+    let mutationStarted = false;
+    let beforeState = stateRef.current;
+    const epoch = projectEpoch.current;
+    const rollback = async () => {
+      // A retry timer owns the edited snapshot closure. Invalidate and cancel
+      // it before restoring so an image the user cancelled cannot appear later.
+      localRevision.current += 1;
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+      const rollbackState = connection.current.projectId ? lastSyncedState.current : beforeState;
+      stateRef.current = rollbackState;
+      setState(rollbackState);
+      localDirty.current = false;
+      await restoreProjectRef.current(rollbackState, epoch, true);
+      setSyncStatus(connection.current.projectId ? "Sincronizado" : "Listo para crear");
+    };
+    try {
+      // Start the edit from a confirmed checkpoint. This makes the following
+      // VM mutation transactional and gives rollback an exact canonical base.
+      if (!await snapshotRuntime(undefined, true)) {
+        showToast("Primero termina de sincronizar los cambios pendientes");
+        return false;
+      }
+      beforeState = stateRef.current;
+      const target = vm.runtime.targets.find((candidate: any) => candidate.isOriginal !== false && targetStableIds.current.get(candidate.id) === editor.targetStableId) ?? vm.runtime.getTargetById(editor.targetId);
+      if (!target) {
+        showToast(editor.kind === "backdrop" ? "Ese fondo fue eliminado durante la edición" : "Ese sprite fue eliminado durante la edición");
+        return false;
+      }
+      const index = target.getCostumes?.().findIndex((costume: any) => costume.lumoMediaId === editor.mediaId) ?? -1;
+      if (index < 0) {
+        showToast(editor.kind === "backdrop" ? "Ese fondo fue eliminado durante la edición" : "Ese disfraz fue eliminado durante la edición");
+        return false;
+      }
+      mutationStarted = true;
+      vm.setEditingTarget(target.id);
+      vm.renameCostume(index, (result.name.trim() || editor.name).slice(0, 40));
+      vm.updateSvg(index, result.svg, result.rotationCenterX, result.rotationCenterY);
+      target.getCostumes()[index].lumoMediaId = editor.mediaId;
+      target.setCostume(index);
+      refreshRuntimeRef.current();
+      const saved = await snapshotRuntime(`${identity.name} editó ${editor.kind === "backdrop" ? `el fondo ${editor.name}` : `el disfraz ${editor.name}`}`, true, true);
+      if (!saved) {
+        await rollback();
+        showToast("No se guardó el dibujo; se restauró la versión anterior");
+        return false;
+      }
+      setImageEditor(null);
+      showToast(editor.kind === "backdrop" ? "Fondo guardado" : "Disfraz guardado");
+      return true;
+    } catch {
+      if (mutationStarted) await rollback().catch(() => undefined);
+      showToast(mutationStarted ? "No se guardó el dibujo; se restauró la versión anterior" : "No se pudo guardar el dibujo");
+      return false;
+    }
   };
 
   const addSoundFile = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1477,10 +2174,21 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
     try {
       const storage = storageRef.current;
       const data = new Uint8Array(await file.arrayBuffer());
+      if (!validAudioBytes(data, extension)) throw new Error("Firma de audio inválida");
+      const target = vmRef.current.editingTarget;
+      const previousCount = target.getSounds?.().length ?? 0;
       const record = cacheAsset(file, storage.AssetType.Sound, extension, data);
-      await vmRef.current.addSound({...record, md5: record.md5ext, format: "", rate: 0, sampleCount: 0}, vmRef.current.editingTarget.id);
+      await vmRef.current.addSound({...record, md5: record.md5ext, format: "", rate: 0, sampleCount: 0}, target.id);
+      const added = target.getSounds?.()[previousCount];
+      if (!added || !Number.isFinite(Number(added.rate)) || Number(added.rate) <= 0 || !Number.isFinite(Number(added.sampleCount)) || Number(added.sampleCount) <= 0) {
+        if ((target.getSounds?.().length ?? 0) > previousCount) {
+          vmRef.current.setEditingTarget(target.id);
+          vmRef.current.deleteSound(previousCount);
+        }
+        throw new Error("El sonido no contiene muestras reproducibles");
+      }
       refreshRuntimeRef.current();
-      snapshotRuntime(`${identity.name} añadió el sonido ${record.name}`, true, true);
+      await snapshotRuntime(`${identity.name} añadió el sonido ${record.name}`, true, true);
     } catch {
       showToast("No se pudo decodificar ese sonido");
     }
@@ -1532,7 +2240,12 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
   };
 
   const newProject = async () => {
-    if (projectId && !window.confirm("¿Crear un proyecto nuevo? Los cambios sincronizados del proyecto actual se conservarán.")) return;
+    const hasWork = Boolean(projectId || projectName !== "Mi proyecto Lumo" || stateRef.current.projectJson || stateRef.current.blocksXml || stateRef.current.structuralVersion > 0);
+    if (hasWork && !window.confirm(projectId
+      ? "¿Crear un proyecto nuevo? Primero confirmaremos los cambios del proyecto actual."
+      : "¿Crear un proyecto nuevo? Se descartarán los cambios locales de este proyecto.")) return;
+    if (projectId && runtimeReady && !await snapshotRuntime(undefined, true) &&
+        !window.confirm("No se pudo confirmar el último cambio. ¿Crear el proyecto nuevo y descartarlo de todos modos?")) return;
     const next = emptyState(Date.now());
     projectEpoch.current += 1;
     localRevision.current += 1;
@@ -1572,8 +2285,8 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
   const accountSignOutPath = projectId && token ? `/signout-with-chatgpt?return_to=${encodeURIComponent(accountReturnTo)}` : signOutPath;
   const remoteMembers = members.filter(member => member.clientId !== identity.clientId);
   const selectedTarget = targets.find(target => target.name === state.selectedSprite) ?? targets[0];
-  const stageTarget = targets.find(target => target.isStage);
   const spriteTargets = targets.filter(target => !target.isStage);
+  const selectedDisplayName = selectedTarget?.isStage ? "Escenario" : selectedTarget?.name ?? "Escenario";
   const extensionOptions = [
     {id: "pen", icon: "✎", name: "Lápiz", text: "Dibuja, estampa y cambia color."},
     {id: "music", icon: "♫", name: "Música", text: "Notas, instrumentos y ritmo."},
@@ -1604,30 +2317,32 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
 
       <section className="editor-grid">
         <aside className="left-panel">
-          <div className="editor-tabs"><button className={activeTab === "code" ? "active" : ""} onClick={() => setActiveTab("code")}>Código</button><button className={activeTab === "costumes" ? "active" : ""} onClick={() => setActiveTab("costumes")}>Disfraces</button><button className={activeTab === "sounds" ? "active" : ""} onClick={() => setActiveTab("sounds")}>Sonidos</button></div>
+          <div className="editor-tabs"><button className={activeTab === "code" ? "active" : ""} onClick={() => openTab("code")}>Código</button><button className={activeTab === "costumes" ? "active" : ""} onClick={() => openTab("costumes")}>Disfraces</button><button className={activeTab === "backdrops" ? "active" : ""} onClick={() => openTab("backdrops")}>Fondos</button><button className={activeTab === "sounds" ? "active" : ""} onClick={() => openTab("sounds")}>Sonidos</button></div>
           <div className="engine-note"><span>●</span>{runtimeReady ? "Scratch VM conectado · 60 TPS" : "Cargando motor Scratch…"}</div>
-          {activeTab === "code" && <><div className="tool-hint"><strong>Programa a {state.selectedSprite}</strong><span>Arrastra bloques. La bandera ejecuta exactamente lo que construyas.</span></div><div className="quick-actions"><button disabled={!runtimeReady} onClick={() => workspaceRef.current?.cleanUp?.()}>Ordenar bloques</button><button disabled={!runtimeReady} onClick={() => workspaceRef.current?.zoomToFit?.()}>Ver todo</button></div><div className="feature-list"><span>✓ Variables y listas</span><span>✓ Mis bloques</span><span>✓ Importación Scratch 3</span><span>✓ Operaciones colaborativas</span></div><button className="extensions-button" disabled={!runtimeReady} onClick={openExtensionLibrary}>▦ Añadir extensión</button></>}
-          {activeTab === "costumes" && <><div className="tool-hint"><strong>Disfraces de {state.selectedSprite}</strong><span>Sube imágenes o crea un dibujo nuevo.</span></div><button className="panel-primary" disabled={!runtimeReady} onClick={createCostume}>＋ Nuevo dibujo</button><button className="panel-secondary" disabled={!runtimeReady} onClick={() => costumeInput.current?.click()}>Subir SVG/PNG/JPG</button><input ref={costumeInput} hidden type="file" accept="image/svg+xml,image/png,image/jpeg" onChange={addCostumeFile}/></>}
-          {activeTab === "sounds" && <><div className="tool-hint"><strong>Sonidos de {state.selectedSprite}</strong><span>Sube WAV o MP3 para usarlos desde los bloques.</span></div><button className="panel-primary" disabled={!runtimeReady} onClick={() => soundInput.current?.click()}>＋ Subir sonido</button><input ref={soundInput} hidden type="file" accept="audio/wav,audio/mpeg,.wav,.mp3" onChange={addSoundFile}/></>}
+          {activeTab === "code" && <><div className="tool-hint"><strong>Programa a {selectedDisplayName}</strong><span>Arrastra bloques. La bandera ejecuta exactamente lo que construyas.</span></div><div className="quick-actions"><button disabled={!runtimeReady} onClick={() => workspaceRef.current?.cleanUp?.()}>Ordenar bloques</button><button disabled={!runtimeReady} onClick={() => workspaceRef.current?.zoomToFit?.()}>Ver todo</button></div><div className="feature-list"><span>✓ Variables y listas</span><span>✓ Mis bloques</span><span>✓ Importación Scratch 3</span><span>✓ Operaciones colaborativas</span></div><button className="extensions-button" disabled={!runtimeReady} onClick={openExtensionLibrary}>▦ Añadir extensión</button></>}
+          {activeTab === "costumes" && (selectedTarget && !selectedTarget.isStage ? <><div className="tool-hint"><strong>Disfraces de {selectedDisplayName}</strong><span>Dibuja desde cero o sube una imagen y edítala.</span></div><button className="panel-primary" disabled={!runtimeReady} onClick={createCostume}>✎ Dibujar disfraz</button><button className="panel-secondary" disabled={!runtimeReady} onClick={() => costumeInput.current?.click()}>Subir SVG/PNG/JPG</button><input ref={costumeInput} hidden type="file" accept="image/svg+xml,image/png,image/jpeg" onChange={addCostumeFile}/></> : <><div className="tool-hint"><strong>Proyecto sin sprites</strong><span>Añade un sprite vacío para dibujar su primer disfraz.</span></div><button className="panel-primary" disabled={!runtimeReady} onClick={addSprite}>＋ Dibujar primer sprite</button><button className="panel-secondary" disabled={!runtimeReady} onClick={() => spriteInput.current?.click()}>Subir sprite</button></>)}
+          {activeTab === "backdrops" && <><div className="tool-hint"><strong>Fondos del escenario</strong><span>Edita el fondo blanco, dibuja otro o sube una imagen.</span></div><button className="panel-primary" disabled={!runtimeReady} onClick={createBackdrop}>✎ Dibujar fondo</button><button className="panel-secondary" disabled={!runtimeReady} onClick={() => backdropInput.current?.click()}>Subir SVG/PNG/JPG</button><input ref={backdropInput} hidden type="file" accept="image/svg+xml,image/png,image/jpeg" onChange={addBackdropFile}/></>}
+          {activeTab === "sounds" && <><div className="tool-hint"><strong>Sonidos de {selectedDisplayName}</strong><span>Sube WAV o MP3 para usarlos desde los bloques.</span></div><button className="panel-primary" disabled={!runtimeReady} onClick={() => soundInput.current?.click()}>＋ Subir sonido</button><input ref={soundInput} hidden type="file" accept="audio/wav,audio/mpeg,.wav,.mp3" onChange={addSoundFile}/></>}
+          <input ref={spriteInput} hidden type="file" accept="image/svg+xml,image/png,image/jpeg" onChange={addSpriteFile}/>
         </aside>
 
         <section className="workspace-panel">
-          <div className="workspace-toolbar"><strong>{activeTab === "code" ? "Bloques" : activeTab === "costumes" ? "Biblioteca de disfraces" : "Biblioteca de sonidos"}</strong><span>{projectId ? "Edición compartida activa" : "Los cambios se guardan al invitar"}</span></div>
+          <div className="workspace-toolbar"><strong>{activeTab === "code" ? "Bloques" : activeTab === "costumes" ? "Biblioteca de disfraces" : activeTab === "backdrops" ? "Biblioteca de fondos" : "Biblioteca de sonidos"}</strong><span>{projectId ? "Edición compartida activa" : "Los cambios se guardan al invitar"}</span></div>
           <div className={activeTab === "code" ? "blockly-wrap" : "blockly-wrap hidden-workspace"} ref={blocklyWrap}>
             <div ref={blocklyHost} className="blockly-host" aria-label="Editor visual de bloques"/>
             {activeTab === "code" && remoteMembers.map(member => <div key={member.clientId} className="remote-cursor" style={{left: `${member.cursorX}%`, top: `${member.cursorY}%`, color: member.color}}><span>➤</span><b style={{background: member.color}}>{member.name}</b></div>)}
           </div>
-          {activeTab === "costumes" && <div className="asset-grid">{costumes.map(costume => <article className="asset-card" key={`${costume.index}-${costume.name}`}><div className="asset-preview">{costume.dataUri ? <img src={costume.dataUri} alt={costume.name}/> : <span>?</span>}</div><strong>{costume.name}</strong><div><button disabled={!runtimeReady} onClick={() => selectCostume(costume.index)}>Usar</button><button disabled={!runtimeReady} onClick={() => renameCostume(costume.index, costume.name)}>Renombrar</button><button className="danger" disabled={!runtimeReady} onClick={() => deleteCostume(costume.index)}>Eliminar</button></div></article>)}</div>}
-          {activeTab === "sounds" && <div className="asset-grid">{sounds.map(sound => <article className="asset-card sound-card" key={`${sound.index}-${sound.name}`}><div className="sound-wave">▂▅▇▄▆▃▇▅</div><strong>{sound.name}</strong><div><button disabled={!runtimeReady} onClick={() => playSound(sound.dataUri)}>▶ Oír</button><button disabled={!runtimeReady} onClick={() => renameSound(sound.index, sound.name)}>Renombrar</button><button className="danger" disabled={!runtimeReady} onClick={() => deleteSound(sound.index)}>Eliminar</button></div></article>)}{!sounds.length && <div className="asset-empty">Todavía no hay sonidos. Sube uno desde el panel izquierdo.</div>}</div>}
+          {activeTab === "costumes" && <div className="asset-grid">{selectedTarget && !selectedTarget.isStage ? costumes.map(costume => <article className={costume.selected ? "asset-card selected" : "asset-card"} key={costume.mediaId}><div className="asset-preview">{costume.dataUri ? <img src={costume.dataUri} alt={costume.name}/> : <span>Transparente</span>}</div><strong>{costume.name}</strong>{costume.selected && <span className="asset-badge">En uso</span>}<div><button disabled={!runtimeReady} onClick={() => selectCostume(costume.index, "costume")}>Usar</button><button className="edit" disabled={!runtimeReady} onClick={() => {const target = targetForImageKind("costume"); if (target) openImageEditor(target, costume.index, "costume");}}>✎ Editar</button><button disabled={!runtimeReady} onClick={() => renameCostume(costume.index, costume.name, "costume")}>Renombrar</button><button className="danger" disabled={!runtimeReady} onClick={() => deleteCostume(costume.index, "costume")}>Eliminar</button></div></article>) : <div className="asset-empty"><strong>El proyecto empieza completamente en blanco.</strong><span>No hay sprites ni disfraces de relleno.</span><button onClick={addSprite} disabled={!runtimeReady}>Dibujar primer sprite</button></div>}</div>}
+          {activeTab === "backdrops" && <div className="asset-grid">{backdrops.map(backdrop => <article className={backdrop.selected ? "asset-card selected" : "asset-card"} key={backdrop.mediaId}><div className="asset-preview backdrop-preview">{backdrop.dataUri ? <img src={backdrop.dataUri} alt={backdrop.name}/> : <span>Blanco</span>}</div><strong>{backdrop.name}</strong>{backdrop.selected && <span className="asset-badge">Visible</span>}<div><button disabled={!runtimeReady} onClick={() => selectCostume(backdrop.index, "backdrop")}>Usar</button><button className="edit" disabled={!runtimeReady} onClick={() => {const target = targetForImageKind("backdrop"); if (target) openImageEditor(target, backdrop.index, "backdrop");}}>✎ Editar</button><button disabled={!runtimeReady} onClick={() => renameCostume(backdrop.index, backdrop.name, "backdrop")}>Renombrar</button><button className="danger" disabled={!runtimeReady} onClick={() => deleteCostume(backdrop.index, "backdrop")}>Eliminar</button></div></article>)}</div>}
+          {activeTab === "sounds" && <div className="asset-grid">{sounds.map(sound => <article className="asset-card sound-card" key={sound.mediaId}><div className="sound-wave">▂▅▇▄▆▃▇▅</div><strong>{sound.name}</strong><div><button disabled={!runtimeReady} onClick={() => playSound(sound.dataUri)}>▶ Oír</button><button disabled={!runtimeReady} onClick={() => renameSound(sound.index, sound.name)}>Renombrar</button><button className="danger" disabled={!runtimeReady} onClick={() => deleteSound(sound.index)}>Eliminar</button></div></article>)}{!sounds.length && <div className="asset-empty">Todavía no hay sonidos. Sube uno desde el panel izquierdo.</div>}</div>}
         </section>
 
         <aside className="stage-panel">
           <div className="stage-toolbar"><div><button className={`run-button ${running ? "running" : ""}`} disabled={!runtimeReady} onClick={runProject} aria-label="Ejecutar proyecto">▶</button><button className="stop-button" disabled={!runtimeReady} onClick={stopProject} aria-label="Detener proyecto">■</button></div><span>{state.stageBackdrop}<small>60 TPS · {fps || "—"} FPS pantalla</small></span><button disabled={!runtimeReady} onClick={toggleFullscreen} aria-label="Pantalla completa">⛶</button></div>
           <div className="stage" ref={stageContainer}><canvas ref={stageCanvas} width={480} height={360} aria-label="Vista previa real del proyecto" onPointerMove={event => postMouse(event)} onPointerDown={event => {event.currentTarget.setPointerCapture(event.pointerId); postMouse(event, true);}} onPointerUp={event => postMouse(event, false)} onPointerCancel={event => postMouse(event, false)}/>{!runtimeReady && <div className="stage-loading">Iniciando Scratch VM…</div>}</div>
-          <div className="sprite-heading"><strong>Personajes</strong>{selectedTarget && !selectedTarget.isStage && <span>x {selectedTarget.x} · y {selectedTarget.y} · {selectedTarget.size}%</span>}</div>
-          <div className="sprite-list">{spriteTargets.map(target => <button key={target.id} disabled={!runtimeReady} className={state.selectedSprite === target.name ? "sprite-card selected" : "sprite-card"} onClick={() => selectSprite(target.id)}>{target.thumbnail ? <img src={target.thumbnail} alt=""/> : <span>✦</span>}<b>{target.name}</b></button>)}<button className="add-sprite" disabled={!runtimeReady} onClick={addSprite} aria-label="Añadir personaje">＋</button></div>
-          {stageTarget && <button disabled={!runtimeReady} className={state.selectedSprite === stageTarget.name ? "stage-target selected" : "stage-target"} onClick={() => selectSprite(stageTarget.id)}><span>{stageTarget.thumbnail ? <img src={stageTarget.thumbnail} alt=""/> : "▣"}</span><b>Escenario</b><small>Fondos y bloques</small></button>}
-          {selectedTarget && !selectedTarget.isStage && <div className="sprite-properties"><label>X<input disabled={!runtimeReady} type="number" value={selectedTarget.x} onChange={event => setSpriteProperty("x", event.target.value)}/></label><label>Y<input disabled={!runtimeReady} type="number" value={selectedTarget.y} onChange={event => setSpriteProperty("y", event.target.value)}/></label><label>Tamaño<input disabled={!runtimeReady} type="number" min="1" max="1000" value={selectedTarget.size} onChange={event => setSpriteProperty("size", event.target.value)}/></label><label>Dirección<input disabled={!runtimeReady} type="number" min="-179" max="180" value={selectedTarget.direction} onChange={event => setSpriteProperty("direction", event.target.value)}/></label><button className="delete-sprite" disabled={!runtimeReady} onClick={deleteSelectedSprite}>Eliminar</button></div>}
+          <section className="sprite-section" aria-labelledby="sprites-heading"><div className="sprite-heading"><strong id="sprites-heading">Sprites</strong>{selectedTarget && !selectedTarget.isStage && <span>x {selectedTarget.x} · y {selectedTarget.y} · {selectedTarget.size}%</span>}</div><div className="sprite-list">{spriteTargets.map(target => <button key={target.id} disabled={!runtimeReady} className={state.selectedSprite === target.name ? "sprite-card selected" : "sprite-card"} onClick={() => selectSprite(target.id)}>{target.thumbnail ? <img src={target.thumbnail} alt=""/> : <span>□</span>}<b>{target.name}</b></button>)}{!spriteTargets.length && <div className="sprite-empty-state"><b>Sin sprites</b><span>Tu proyecto comienza vacío.</span></div>}<button className="add-sprite" disabled={!runtimeReady} onClick={addSprite} aria-label="Dibujar sprite nuevo">＋<small>Dibujar</small></button><button className="add-sprite upload-sprite" disabled={!runtimeReady} onClick={() => spriteInput.current?.click()} aria-label="Subir sprite desde una imagen">↑<small>Subir</small></button></div></section>
+          <section className="backdrop-section" aria-labelledby="backdrops-heading"><div className="backdrop-heading"><strong id="backdrops-heading">Fondos</strong><button onClick={() => openTab("backdrops")} disabled={!runtimeReady}>Administrar</button></div><div className="backdrop-list">{backdrops.map(backdrop => <button key={backdrop.mediaId} className={backdrop.selected ? "backdrop-card selected" : "backdrop-card"} disabled={!runtimeReady} onClick={() => {selectCostume(backdrop.index, "backdrop"); if (activeTab === "costumes") setActiveTab("backdrops");}}>{backdrop.dataUri ? <img src={backdrop.dataUri} alt=""/> : <span/>}<b>{backdrop.name}</b></button>)}<button className="add-backdrop" disabled={!runtimeReady} onClick={createBackdrop} aria-label="Dibujar fondo nuevo">＋</button></div></section>
+          {selectedTarget && !selectedTarget.isStage && <><div className="sprite-properties"><label className="sprite-name-field">Nombre<input key={`${selectedTarget.id}:${selectedTarget.name}`} aria-label="Nombre del sprite" disabled={!runtimeReady} defaultValue={selectedTarget.name} maxLength={40} onBlur={event => {renameSelectedSprite(event.target.value); event.currentTarget.value = vmRef.current?.editingTarget?.sprite?.name ?? selectedTarget.name;}} onKeyDown={event => {if (event.key === "Enter") event.currentTarget.blur();}}/></label><label>X<input aria-label="Posición X" disabled={!runtimeReady} type="number" value={selectedTarget.x} onChange={event => setSpriteProperty("x", event.target.value)}/></label><label>Y<input aria-label="Posición Y" disabled={!runtimeReady} type="number" value={selectedTarget.y} onChange={event => setSpriteProperty("y", event.target.value)}/></label><label>Tamaño<input aria-label="Tamaño del sprite" disabled={!runtimeReady} type="number" min="1" max="1000" value={selectedTarget.size} onChange={event => setSpriteProperty("size", event.target.value)}/></label><label>Dirección<input aria-label="Dirección del sprite" disabled={!runtimeReady} type="number" min="-179" max="180" value={selectedTarget.direction} onChange={event => setSpriteProperty("direction", event.target.value)}/></label><button className="delete-sprite" disabled={!runtimeReady} onClick={deleteSelectedSprite}>Eliminar</button></div><div className="sprite-options"><button disabled={!runtimeReady} aria-pressed={selectedTarget.visible} onClick={() => setSpriteOption("visible", !selectedTarget.visible)}>{selectedTarget.visible ? "◉ Visible" : "○ Oculto"}</button><label>Giro<select aria-label="Estilo de rotación" disabled={!runtimeReady} value={selectedTarget.rotationStyle} onChange={event => setSpriteOption("rotationStyle", event.target.value as TargetSummary["rotationStyle"])}><option value="all around">Libre</option><option value="left-right">Izquierda/derecha</option><option value="don't rotate">Sin girar</option></select></label></div></>}
           <div className="team-panel"><div className="team-tabs"><button className={!activityOpen ? "active" : ""} onClick={() => setActivityOpen(false)}>Comentarios <span>{comments.length}</span></button><button className={activityOpen ? "active" : ""} onClick={() => setActivityOpen(true)}>Actividad</button></div>{activityOpen ? <div className="activity-list">{[...state.activity].reverse().slice(0, 5).map(item => <div key={item.id}><span className="activity-icon">✓</span><p>{item.text}<small>{item.at ? new Date(item.at).toLocaleTimeString("es", {hour: "2-digit", minute: "2-digit"}) : "ahora"}</small></p></div>)}</div> : <div className="comments-list">{comments.slice(0, 5).map(comment => <div key={comment.id}><span className="comment-avatar" style={{background: comment.color}}>{comment.author.charAt(0)}</span><p><b>{comment.author}</b>{comment.message}</p></div>)}{!comments.length && <p className="empty-comments">Comenta una idea para tu equipo.</p>}<div className="comment-compose"><input disabled={!runtimeReady} value={commentText} maxLength={240} onChange={event => setCommentText(event.target.value)} onKeyDown={event => {if (event.key === "Enter") void addComment();}} placeholder="Escribe un comentario…" aria-label="Nuevo comentario"/><button disabled={!runtimeReady || !commentText.trim()} onClick={addComment} aria-label="Enviar comentario">↑</button></div></div>}</div>
         </aside>
       </section>
@@ -1636,6 +2351,7 @@ export default function LumoStudio({user, profile, signOutPath}: Props) {
 
       {inviteOpen && <div className="modal-backdrop" role="presentation" onMouseDown={event => {if (event.target === event.currentTarget) setInviteOpen(false);}}><section className="invite-modal" role="dialog" aria-modal="true" aria-labelledby="invite-title"><button className="modal-close" onClick={() => setInviteOpen(false)} aria-label="Cerrar">×</button><span className="modal-icon">↗</span><h2 id="invite-title">Crea en equipo</h2><p>Cualquier persona con este enlace podrá entrar y editar. Los bloques viajan como operaciones ordenadas para no reemplazar todo el lienzo.</p><label>Enlace de invitación</label><div className="invite-link"><input readOnly value={inviteUrl} onFocus={event => event.currentTarget.select()}/><button onClick={async () => {try {await navigator.clipboard.writeText(inviteUrl); showToast("Enlace copiado");} catch {showToast("Selecciona y copia el enlace");}}}>Copiar</button></div><div className="live-proof"><div className="avatar-stack">{[identity, ...remoteMembers].slice(0, 3).map(member => <span key={member.clientId} className="mini-avatar" style={{background: member.color}}>{member.name.charAt(0)}</span>)}</div><span><b>{Math.max(1, members.length)} en línea</b> · sincronización subsegundo</span></div><small>Abre el enlace en otra ventana para trabajar simultáneamente.</small></section></div>}
       {extensionOpen && <div className="modal-backdrop" role="presentation" onMouseDown={event => {if (event.target === event.currentTarget) setExtensionOpen(false);}}><section className="invite-modal extension-modal" role="dialog" aria-modal="true" aria-labelledby="extension-title"><button className="modal-close" onClick={() => setExtensionOpen(false)} aria-label="Cerrar">×</button><span className="modal-icon">▦</span><h2 id="extension-title">Extensiones Scratch</h2><p>Añade capacidades oficiales al motor y sus bloques al toolbox.</p><div className="extension-grid">{extensionOptions.map(option => <button key={option.id} onClick={() => installExtension(option.id)} disabled={!runtimeReady || installedExtensions.includes(option.id)}><span>{option.icon}</span><strong>{option.name}</strong><small>{installedExtensions.includes(option.id) ? "Añadida" : option.text}</small></button>)}</div></section></div>}
+      {imageEditor && <ImageEditor document={imageEditor} maxAssetBytes={MAX_PROJECT_ASSET_BYTES} onClose={() => setImageEditor(null)} onSave={saveImageEdit}/>}
       {toast && <div className="toast" role="status">✓ {toast}</div>}
     </main>
   );

@@ -1,4 +1,4 @@
-import {consumeRateLimit, database, ensureCollaborationSchema, json, MAX_D1_PAYLOAD_BYTES, MAX_PROJECT_ASSETS, MAX_PROJECT_ASSET_TOTAL_BYTES, validAssetMetadata} from "../../../../../../db/collaboration";
+import {consumeRateLimit, database, ensureCollaborationSchema, json, MAX_D1_PAYLOAD_BYTES, MAX_STORED_PROJECT_ASSETS, MAX_STORED_PROJECT_ASSET_TOTAL_BYTES, pruneUnreferencedProjectAssets, validAssetMetadata} from "../../../../../../db/collaboration";
 
 export const dynamic = "force-dynamic";
 
@@ -116,9 +116,12 @@ export async function PUT(request: Request, context: Context) {
     if (existing.dataFormat !== dataFormat || existing.assetType !== assetType || !sameBytes(d1Bytes(existing.data), data)) {
       return json({error: "El asset inmutable ya existe con otros metadatos o contenido"}, 409);
     }
-    return json({ok: true, assetId, reused: true}, 200);
+    const touched = await database().prepare(
+      "UPDATE project_assets SET created_at = ? WHERE project_id = ? AND asset_id = ?",
+    ).bind(Date.now(), id, assetId).run();
+    if (Number(touched.meta?.changes ?? 0) === 1) return json({ok: true, assetId, reused: true}, 200);
   }
-  const insert = await database().prepare(
+  const insertAsset = () => database().prepare(
     `INSERT INTO project_assets (project_id, asset_id, data_format, asset_type, data, created_at)
      SELECT ?, ?, ?, ?, ?, ?
      WHERE (SELECT COUNT(*) FROM project_assets WHERE project_id = ?) < ?
@@ -126,8 +129,15 @@ export async function PUT(request: Request, context: Context) {
      ON CONFLICT(project_id, asset_id) DO NOTHING`,
   ).bind(
     id, assetId, dataFormat, assetType, data.buffer, Date.now(),
-    id, MAX_PROJECT_ASSETS, id, data.byteLength, MAX_PROJECT_ASSET_TOTAL_BYTES,
+    id, MAX_STORED_PROJECT_ASSETS, id, data.byteLength, MAX_STORED_PROJECT_ASSET_TOTAL_BYTES,
   ).run();
+  let insert = await insertAsset();
+  if (Number(insert.meta?.changes ?? 0) !== 1) {
+    // Reclaim only after the buffered insert fails. Normal multi-asset uploads
+    // therefore keep their full lease even when they take several minutes.
+    await pruneUnreferencedProjectAssets(id).catch(() => 0);
+    insert = await insertAsset();
+  }
   if (Number(insert.meta?.changes ?? 0) !== 1) {
     const concurrent = await database().prepare(
       "SELECT data_format AS dataFormat, asset_type AS assetType, data, LENGTH(data) AS byteLength FROM project_assets WHERE project_id = ? AND asset_id = ?",
@@ -136,15 +146,19 @@ export async function PUT(request: Request, context: Context) {
       if (concurrent.dataFormat !== dataFormat || concurrent.assetType !== assetType || !sameBytes(d1Bytes(concurrent.data), data)) {
         return json({error: "El asset inmutable ya existe con otros metadatos o contenido"}, 409);
       }
-      return json({ok: true, assetId, reused: true}, 200);
+      const touched = await database().prepare(
+        "UPDATE project_assets SET created_at = ? WHERE project_id = ? AND asset_id = ?",
+      ).bind(Date.now(), id, assetId).run();
+      if (Number(touched.meta?.changes ?? 0) === 1) return json({ok: true, assetId, reused: true}, 200);
+      return json({error: "El asset cambió durante la sincronización; reintenta"}, 503);
     }
     const quota = await database().prepare(
       "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(data)), 0) AS totalBytes FROM project_assets WHERE project_id = ?",
     ).bind(id).first<{count: number; totalBytes: number}>();
-    if (Number(quota?.count ?? 0) >= MAX_PROJECT_ASSETS) {
-      return json({error: `El proyecto alcanzó el máximo de ${MAX_PROJECT_ASSETS} recursos`}, 429);
-    }
-    return json({error: "El proyecto supera 50 MB de recursos sincronizados"}, 413);
+    const error = Number(quota?.count ?? 0) >= MAX_STORED_PROJECT_ASSETS
+      ? "El proyecto está liberando recursos antiguos; el guardado se reintentará"
+      : "El proyecto está liberando espacio de recursos; el guardado se reintentará";
+    return json({error}, 503, {"Retry-After": "15"});
   }
   return json({ok: true, assetId, byteLength: data.byteLength}, 201);
 }

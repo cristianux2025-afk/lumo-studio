@@ -11,8 +11,10 @@ Lumo Studio es un estudio libre de programación visual compatible con proyectos
 - Scratch VM, Renderer WebGL, Audio, Storage y adaptador SVG/bitmap conectados al editor.
 - Bandera verde, detener, teclado, ratón, vista previa y pantalla completa.
 - Ejecución de Scratch VM a 60 TPS. El lienzo se presenta con `requestAnimationFrame`; los FPS visibles dependen del navegador y del equipo.
-- Personajes, escenario, posición, tamaño y dirección.
-- Disfraces SVG/PNG/JPG y sonidos WAV/MP3, con recursos sincronizados entre colaboradores.
+- Cada proyecto nuevo empieza con un escenario blanco y sin sprites, imágenes ni bloques de relleno.
+- Apartados independientes para sprites y fondos, además de posición, tamaño y dirección.
+- Editor gráfico para disfraces y fondos con pincel, borrador, línea, rectángulo, elipse, relleno, cuentagotas, zoom y deshacer/rehacer.
+- Disfraces y fondos SVG/PNG/JPG y sonidos WAV/MP3, con recursos sincronizados entre colaboradores.
 - Importación y exportación de proyectos `.sb3`.
 - Extensiones integradas de Lápiz, Música, Texto a voz y Traducir.
 - Inicio de sesión con ChatGPT y perfil persistente de Lumo.
@@ -27,7 +29,7 @@ El token incluido en el enlace concede permiso de edición: cualquier persona qu
 - Cada personaje lleva un identificador persistente dentro del snapshot. Un renombre concurrente se fusiona con las propiedades del mismo personaje y los nombres duplicados se desambiguan sin descartar objetos.
 - Presencia, cursores, comentarios y comprobación de snapshots se actualizan cada 2,5 s.
 - La comprobación periódica omite el estado completo cuando la versión no cambió; el snapshot sólo se descarga cuando hace falta.
-- Los disfraces y sonidos se almacenan como BLOB inmutables, con un máximo de 1,75 MB por recurso para respetar el límite de fila de D1. Antes de guardar, el servidor verifica contenido, metadatos y referencias. Los recursos permanecen retenidos durante la vida del proyecto para que un guardado concurrente nunca pueda perderlos.
+- Los disfraces y sonidos se almacenan como BLOB inmutables, con un máximo de 1,75 MB por recurso para respetar el límite de fila de D1. Antes de guardar, el servidor verifica contenido, metadatos y referencias. Cada carga recibe una ventana de seguridad renovable; después de confirmar el snapshot, sólo se eliminan recursos antiguos que ya no estén referenciados.
 - Cada proyecto compartido admite hasta 100 recursos y 50 MB de recursos sincronizados; ambas cuotas se aplican atómicamente. Se conservan los 200 comentarios más recientes.
 - Cada pestaña usa una identidad efímera distinta para evitar que dos pestañas del mismo navegador ignoren sus cambios.
 - Las mutaciones tienen límites de frecuencia fijos por proyecto y red, además de límites por identidad, de modo que cambiar el ID del cliente no amplía la cuota. Los nombres autenticados se derivan del perfil guardado y nunca usan el correo como nombre público; las personas sin sesión aparecen explícitamente como invitadas.
@@ -65,7 +67,7 @@ npm run typecheck
 npm test
 ```
 
-`npm test` valida tipos, lint, construye la versión de producción y ejecuta los contratos estáticos. `npm run test:browser` comprueba las APIs, cuotas atómicas, el VM, los bloques, el escenario y una sesión real de colaboración entre dos pestañas, incluidos conflicto CAS, renombre concurrente, assets y creación/eliminación ordenada de bloques.
+`npm test` valida tipos, lint, construye la versión de producción y ejecuta los contratos estáticos. `npm run test:browser` comprueba las APIs, el inicio vacío, el editor gráfico y su rollback, las cuotas atómicas, el VM, los bloques, las extensiones, pantalla completa, sprites, fondos, sonidos WAV, importación/exportación `.sb3`, login, registro y una sesión real de colaboración entre dos pestañas, incluidos conflicto CAS, renombre concurrente, recursos y creación/eliminación ordenada de bloques.
 
 ## Cuentas y proyectos
 

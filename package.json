@@ -20,7 +20,7 @@
     "build": "vinext build",
     "start": "vinext start",
     "test": "npm run typecheck && npm run lint && npm run build && node tests/feature-contract.test.mjs && node tests/rendered-html.test.mjs",
-    "test:browser": "node scripts/api-smoke.mjs && node scripts/cdp-smoke.mjs && node scripts/cdp-block-bridge.mjs && node scripts/cdp-collaboration.mjs",
+    "test:browser": "node scripts/api-smoke.mjs && node scripts/cdp-smoke.mjs && node scripts/cdp-image-editor.mjs && node scripts/cdp-controls.mjs && node scripts/cdp-block-bridge.mjs && node scripts/cdp-collaboration.mjs",
     "licenses:generate": "node scripts/generate-third-party-notices.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint app db scripts tests eslint.config.mjs vite.config.ts",

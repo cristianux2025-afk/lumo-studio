@@ -23,17 +23,57 @@ test("connects Scratch VM to the real stage and 60 TPS runtime controls", async 
 test("all visible editor surfaces have working handlers", async () => {
   const [studio, config] = await Promise.all([source("app/LumoStudio.tsx"), source("app/studio-config.ts")]);
 
-  assert.match(studio, /setActiveTab\("costumes"\)/);
-  assert.match(studio, /setActiveTab\("sounds"\)/);
+  assert.match(studio, /openTab\("costumes"\)/);
+  assert.match(studio, /openTab\("sounds"\)/);
   assert.match(studio, /requestFullscreen/);
   assert.match(studio, /importProject/);
   assert.match(studio, /exportProject/);
   assert.match(studio, /addSprite/);
   assert.match(studio, /openExtensionLibrary/);
   assert.match(studio, /starterProjectRef\.current/);
-  assert.match(studio, /stage-target/);
+  assert.match(studio, /getTargetForStage/);
   assert.match(config, /<shadow type=/);
   assert.match(config, /event_whenbroadcastreceived/);
+});
+
+test("starts blank and exposes complete sprite, backdrop, and image editing surfaces", async () => {
+  const [studio, config, imageEditor] = await Promise.all([
+    source("app/LumoStudio.tsx"),
+    source("app/studio-config.ts"),
+    source("app/ImageEditor.tsx"),
+  ]);
+
+  const starterProject = config.slice(config.indexOf("export function buildStarterProject"));
+  const starterXml = config.match(/export const starterXml = ([^;]+);/)?.[1] ?? "";
+  assert.match(starterXml, /<xml[^>]*><\/xml>/);
+  assert.doesNotMatch(starterXml, /<block\b/);
+  assert.match(starterProject, /isStage:\s*true/);
+  assert.match(starterProject, /vectorCostume\("Fondo 1"/);
+  assert.doesNotMatch(starterProject, /isStage:\s*false/);
+  assert.doesNotMatch(config, /Lumi|Bosque lunar/);
+  assert.match(config, /stageSvg[\s\S]+fill="#fff"/);
+  assert.match(config, /blankSpriteSvg[\s\S]+fill-opacity="0"/);
+
+  assert.match(studio, /className="sprite-section"/);
+  assert.match(studio, /className="backdrop-section"/);
+  assert.match(studio, /className="add-sprite"/);
+  assert.match(studio, /Proyecto sin sprites/);
+  assert.match(studio, /<ImageEditor\b/);
+  assert.match(studio, /vm\.updateSvg\(/);
+
+  assert.match(imageEditor, /data-testid="image-editor"/);
+  assert.match(imageEditor, /data-testid="image-editor-canvas"/);
+  assert.match(imageEditor, /data-testid="image-editor-save"/);
+  for (const tool of ["brush", "eraser", "line", "rectangle", "ellipse", "fill", "eyedropper"]) {
+    assert.match(imageEditor, new RegExp(`id: "${tool}"`));
+  }
+  assert.match(imageEditor, /data-testid=\{`image-editor-tool-\$\{candidate\.id\}`\}/);
+  assert.match(imageEditor, /const undo = useCallback/);
+  assert.match(imageEditor, /const redo = useCallback/);
+  assert.match(imageEditor, /const clearCanvas = useCallback/);
+  assert.match(imageEditor, /function floodFill/);
+  assert.match(imageEditor, /onPointerDown=\{beginInteraction\}/);
+  assert.match(imageEditor, /await onSave\(result\)/);
 });
 
 test("ships Sites-compatible login, registration, and persisted profiles", async () => {
@@ -67,7 +107,10 @@ test("persists validated ordered collaboration events and immutable assets behin
 
   assert.match(projectApi, /expectedVersion/);
   assert.match(projectApi, /missingAssets/);
-  assert.doesNotMatch(projectApi, /DELETE FROM project_assets/);
+  assert.match(projectApi, /UPDATE project_assets SET created_at/);
+  assert.match(projectApi, /pruneUnreferencedProjectAssets/);
+  assert.match(projectApi, /json_each\(\?\)/);
+  assert.match(projectApi, /activeAssetBytes > MAX_PROJECT_ASSET_TOTAL_BYTES/);
   assert.match(eventApi, /invite_token/);
   assert.match(eventApi, /project_events/);
   assert.match(eventApi, /allowedTypes/);
@@ -76,7 +119,8 @@ test("persists validated ordered collaboration events and immutable assets behin
   assert.match(eventApi, /SELECT \?, \?, \?, \?, \?/);
   assert.match(assetApi, /readLimitedBody/);
   assert.match(assetApi, /ON CONFLICT\(project_id, asset_id\) DO NOTHING/);
-  assert.match(assetApi, /MAX_PROJECT_ASSET_TOTAL_BYTES/);
+  assert.match(assetApi, /MAX_STORED_PROJECT_ASSET_TOTAL_BYTES/);
+  assert.match(assetApi, /pruneUnreferencedProjectAssets/);
   assert.match(assetApi, /sameBytes/);
   assert.match(assetApi, /SELECT \?, \?, \?, \?, \?, \?/);
   assert.match(assetApi, /Content-Security-Policy/);
@@ -84,6 +128,9 @@ test("persists validated ordered collaboration events and immutable assets behin
   assert.match(collaboration, /CREATE TABLE IF NOT EXISTS project_creation_limits/);
   assert.match(collaboration, /readLimitedJson/);
   assert.match(collaboration, /consumeRateLimit/);
+  assert.match(collaboration, /PROJECT_ASSET_UPLOAD_LEASE_MS/);
+  assert.match(collaboration, /json_each\(projects\.state/);
+  assert.match(collaboration, /input\.assets\.length > MAX_PROJECT_ASSETS/);
   assert.match(collaboration, /networkHits > networkLimit/);
   assert.match(collaboration, /opaqueClientId/);
   assert.match(collaboration, /Number\.isSafeInteger\(eventSeq\)/);
@@ -98,6 +145,9 @@ test("persists validated ordered collaboration events and immutable assets behin
   assert.match(studio, /mergeProjectStates/);
   assert.match(studio, /lastSyncedState/);
   assert.match(studio, /snapshotQueue/);
+  assert.match(studio, /class AssetSyncError/);
+  assert.match(studio, /projectJsonAssets/);
+  assert.doesNotMatch(studio, /costume\.mediaId, costume\.dataUri/);
   assert.match(studio, /lumoTargetId/);
   assert.match(studio, /lumoMediaId/);
   assert.match(studio, /targetId/);

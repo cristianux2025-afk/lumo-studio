@@ -1,5 +1,5 @@
 import {getChatGPTUser} from "../../../chatgpt-auth";
-import {cleanText, consumeRateLimit, database, ensureCollaborationSchema, isRecord, json, MAX_PROJECT_REQUEST_BYTES, MAX_SMALL_REQUEST_BYTES, MAX_STRUCTURAL_VERSION, normalizeProjectState, opaqueClientId, readLimitedJson, type ProjectState} from "../../../../db/collaboration";
+import {cleanText, consumeRateLimit, database, ensureCollaborationSchema, isRecord, json, MAX_PROJECT_ASSET_TOTAL_BYTES, MAX_PROJECT_REQUEST_BYTES, MAX_SMALL_REQUEST_BYTES, MAX_STRUCTURAL_VERSION, normalizeProjectState, opaqueClientId, pruneUnreferencedProjectAssets, readLimitedJson, type ProjectState} from "../../../../db/collaboration";
 
 export const dynamic = "force-dynamic";
 
@@ -104,6 +104,16 @@ export async function PATCH(request: Request, context: Context) {
   safeState.structuralVersion = safeState.structuralVersion > previousState.structuralVersion
     ? Math.min(previousState.structuralVersion + 1, MAX_STRUCTURAL_VERSION)
     : previousState.structuralVersion;
+  if (safeState.assets.length) {
+    // Renew every desired reference before validating it. A concurrent GC can
+    // either delete first (the following SELECT reports it missing) or observe
+    // this fresh lease and leave it in place until the CAS commits.
+    await database().prepare(
+      `UPDATE project_assets SET created_at = ?
+       WHERE project_id = ?
+         AND asset_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+    ).bind(now, id, JSON.stringify(safeState.assets.map(asset => asset.assetId))).run();
+  }
   const [latestEvent, storedAssets] = await Promise.all([
     database().prepare(
       "SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM project_events WHERE project_id = ?",
@@ -126,6 +136,10 @@ export async function PATCH(request: Request, context: Context) {
   if (missingAssets.length) {
     return json({error: "Faltan recursos del proyecto; vuelve a sincronizarlos", missingAssets}, 424);
   }
+  const activeAssetBytes = safeState.assets.reduce((total, asset) => total + asset.byteLength, 0);
+  if (activeAssetBytes > MAX_PROJECT_ASSET_TOTAL_BYTES) {
+    return json({error: "El proyecto supera 50 MB de recursos activos"}, 413);
+  }
   const update = await database().prepare(
     "UPDATE projects SET name = ?, state = ?, version = ?, updated_at = ?, updated_by = ? WHERE id = ? AND invite_token = ? AND version = ?",
   ).bind(cleanText(body.name, project.name, 70), JSON.stringify(safeState), nextVersion, now, cleanText(body.clientId, "anon", 80), id, body.token, expectedVersion).run();
@@ -145,9 +159,10 @@ export async function PATCH(request: Request, context: Context) {
       "DELETE FROM project_events WHERE project_id = ? AND seq <= ?",
     ).bind(id, retentionFloor).run().catch(() => undefined);
   }
-  // Assets are content-addressed, immutable and quota-bounded. Keep uploaded
-  // rows for the lifetime of the project: request-time garbage collection can
-  // otherwise race a concurrent CAS between reference validation and commit.
+  // Content-addressed uploads carry a short lease. Once the new snapshot is
+  // committed, old unreferenced blobs outside that lease can be reclaimed
+  // without racing another collaborator's upload/CAS sequence.
+  await pruneUnreferencedProjectAssets(id, now).catch(() => 0);
   return json({ version: nextVersion, updatedAt: now });
 }
 
