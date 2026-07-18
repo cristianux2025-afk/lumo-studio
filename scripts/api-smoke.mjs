@@ -1,4 +1,5 @@
 const base = (process.argv[2] ?? "http://localhost:4173").replace(/\/$/, "");
+const localBase = new Set(["localhost", "127.0.0.1", "::1"]).has(new URL(base).hostname);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -277,51 +278,47 @@ assert(events.response.ok && events.body?.events?.length === 2 && events.body.ev
 
 const anonymousProfile = await request("/api/profile");
 assert(anonymousProfile.response.status === 401, "El perfil se expuso sin sesión");
-const unprofiledEmail = `unprofiled-${crypto.randomUUID()}@example.com`;
-const unprofiledHeaders = {
-  ...jsonHeaders,
-  "oai-authenticated-user-email": unprofiledEmail,
-};
-const unprofiledComment = await request(`/api/projects/${id}`, {
-  method: "POST",
-  headers: unprofiledHeaders,
-  body: JSON.stringify({action: "comment", token, clientId: "unprofiled-comment", message: "Identidad sin perfil"}),
-});
-assert(unprofiledComment.response.status === 201, "No se pudo comprobar la identidad autenticada sin perfil");
-assert(
-  !String(unprofiledComment.body?.comment?.author ?? "").toLowerCase().includes(unprofiledEmail.toLowerCase()),
-  "Un comentario autenticado sin perfil expuso el correo del usuario",
-);
-const unprofiledPresence = await request(`/api/projects/${id}`, {
-  method: "POST",
-  headers: unprofiledHeaders,
-  body: JSON.stringify({action: "presence", token, clientId: "unprofiled-presence", cursorX: 25, cursorY: 30}),
-});
-assert(unprofiledPresence.response.ok, "No se pudo comprobar la presencia autenticada sin perfil");
-const unprofiledProject = await request(`/api/projects/${id}?token=${token}&viewer=unprofiled-presence`);
-const unprofiledMember = unprofiledProject.body?.members?.find(member => member.clientId === "unprofiled-presence");
-assert(unprofiledMember, "La presencia autenticada sin perfil no quedó visible");
-assert(
-  !String(unprofiledMember.name ?? "").toLowerCase().includes(unprofiledEmail.toLowerCase()),
-  "La presencia autenticada sin perfil expuso el correo del usuario",
-);
 const authHeaders = {
   ...jsonHeaders,
   "oai-authenticated-user-email": `api-smoke-${crypto.randomUUID()}@example.com`,
   "oai-authenticated-user-full-name": "API%20Smoke",
   "oai-authenticated-user-full-name-encoding": "percent-encoded-utf-8",
 };
-const nullProfile = await request("/api/profile", {method: "PUT", headers: authHeaders, body: "null"});
-assert(nullProfile.response.status === 400, "PUT /api/profile no rechazó JSON null con sesión");
-const oversizedProfile = await request("/api/profile", {method: "PUT", headers: authHeaders, body: JSON.stringify({displayName: "API", handle: "api_smoke", filler: "x".repeat(8_100)})});
-assert(oversizedProfile.response.status === 413, "PUT /api/profile cargó un cuerpo por encima del límite");
-const handle = `smoke_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
-const savedProfile = await request("/api/profile", {method: "PUT", headers: authHeaders, body: JSON.stringify({displayName: "API Smoke", handle})});
-assert(savedProfile.response.ok && savedProfile.body?.profile?.handle === handle, "No se guardó el perfil autenticado");
-const verifiedComment = await request(`/api/projects/${id}`, {
-  method: "POST", headers: authHeaders,
-  body: JSON.stringify({action: "comment", token, clientId: "verified-smoke", name: "Nombre falsificado", color: "#000000", message: "Identidad verificada"}),
-});
-assert(verifiedComment.response.status === 201 && verifiedComment.body?.comment?.author === "API Smoke" && verifiedComment.body?.comment?.color === savedProfile.body.profile.avatarColor, "El servidor confió en una identidad autenticada enviada por el cliente");
+if (localBase) {
+  const unprofiledEmail = `unprofiled-${crypto.randomUUID()}@example.com`;
+  const unprofiledHeaders = {...jsonHeaders, "oai-authenticated-user-email": unprofiledEmail};
+  const unprofiledComment = await request(`/api/projects/${id}`, {
+    method: "POST",
+    headers: unprofiledHeaders,
+    body: JSON.stringify({action: "comment", token, clientId: "unprofiled-comment", message: "Identidad sin perfil"}),
+  });
+  assert(unprofiledComment.response.status === 201, "No se pudo comprobar la identidad autenticada sin perfil");
+  assert(!String(unprofiledComment.body?.comment?.author ?? "").toLowerCase().includes(unprofiledEmail.toLowerCase()), "Un comentario autenticado sin perfil expuso el correo del usuario");
+  const unprofiledPresence = await request(`/api/projects/${id}`, {
+    method: "POST",
+    headers: unprofiledHeaders,
+    body: JSON.stringify({action: "presence", token, clientId: "unprofiled-presence", cursorX: 25, cursorY: 30}),
+  });
+  assert(unprofiledPresence.response.ok, "No se pudo comprobar la presencia autenticada sin perfil");
+  const unprofiledProject = await request(`/api/projects/${id}?token=${token}&viewer=unprofiled-presence`);
+  const unprofiledMember = unprofiledProject.body?.members?.find(member => member.clientId === "unprofiled-presence");
+  assert(unprofiledMember, "La presencia autenticada sin perfil no quedó visible");
+  assert(!String(unprofiledMember.name ?? "").toLowerCase().includes(unprofiledEmail.toLowerCase()), "La presencia autenticada sin perfil expuso el correo del usuario");
+  const nullProfile = await request("/api/profile", {method: "PUT", headers: authHeaders, body: "null"});
+  assert(nullProfile.response.status === 400, "PUT /api/profile no rechazó JSON null con sesión");
+  const oversizedProfile = await request("/api/profile", {method: "PUT", headers: authHeaders, body: JSON.stringify({displayName: "API", handle: "api_smoke", filler: "x".repeat(8_100)})});
+  assert(oversizedProfile.response.status === 413, "PUT /api/profile cargó un cuerpo por encima del límite");
+  const handle = `smoke_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const savedProfile = await request("/api/profile", {method: "PUT", headers: authHeaders, body: JSON.stringify({displayName: "API Smoke", handle})});
+  assert(savedProfile.response.ok && savedProfile.body?.profile?.handle === handle, "No se guardó el perfil autenticado");
+  const verifiedComment = await request(`/api/projects/${id}`, {
+    method: "POST", headers: authHeaders,
+    body: JSON.stringify({action: "comment", token, clientId: "verified-smoke", name: "Nombre falsificado", color: "#000000", message: "Identidad verificada"}),
+  });
+  assert(verifiedComment.response.status === 201 && verifiedComment.body?.comment?.author === "API Smoke" && verifiedComment.body?.comment?.color === savedProfile.body.profile.avatarColor, "El servidor confió en una identidad autenticada enviada por el cliente");
+} else {
+  const spoofedProfile = await request("/api/profile", {method: "PUT", headers: authHeaders, body: JSON.stringify({displayName: "Suplantado", handle: "spoofed"})});
+  assert(spoofedProfile.response.status === 401, "El despliegue aceptó encabezados de identidad suministrados por el cliente");
+}
 
 console.log(JSON.stringify({projectId: id, eventSeqs: [validEvent.body.seq, secondEvent.body.seq], assetBytes: originalBytes.byteLength, assetLimit: true, atomicQuota, boundedJson: true, conditionalState: true, cas: true, auth: true, cursorZero: true, validators: true}, null, 2));
