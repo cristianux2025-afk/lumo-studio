@@ -2,7 +2,7 @@
 
 Lumo Studio es un estudio libre de programación visual compatible con proyectos Scratch 3, con edición colaborativa mediante enlaces de invitación.
 
-- Sitio: <https://lumo-studio.onovapremium2.chatgpt.site>
+- Sitio: <https://lumo-studio-collab.onovatech1.chatgpt.site>
 - Código: <https://github.com/cristianux2025-afk/lumo-studio>
 
 ## Qué funciona

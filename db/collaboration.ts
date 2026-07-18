@@ -180,13 +180,11 @@ export async function consumeRateLimit(
     };
   };
   const increment = async (bucket: string) => {
-    await database().prepare(
-      `INSERT INTO project_creation_limits (bucket, hits, expires_at) VALUES (?, 1, ?)
-       ON CONFLICT(bucket) DO UPDATE SET hits = hits + 1`,
-    ).bind(bucket, expiresAt).run();
     const counter = await database().prepare(
-      "SELECT hits FROM project_creation_limits WHERE bucket = ?",
-    ).bind(bucket).first<{hits: number}>();
+      `INSERT INTO project_creation_limits (bucket, hits, expires_at) VALUES (?, 1, ?)
+       ON CONFLICT(bucket) DO UPDATE SET hits = hits + 1, expires_at = excluded.expires_at
+       RETURNING hits`,
+    ).bind(bucket, expiresAt).first<{hits: number}>();
     return Number(counter?.hits ?? 0);
   };
 
